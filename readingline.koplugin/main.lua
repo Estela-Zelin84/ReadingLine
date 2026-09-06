@@ -266,6 +266,28 @@ end
 
 local book_overrides = loadOverrides()
 
+-- Manual collections complement folder and embedded metadata categories
+-- without rewriting the book file itself.  Keep their names separately so an
+-- empty collection remains available after its last book is removed.
+local function loadManualCategories()
+    local value = store:readSetting("manual_book_categories")
+    return type(value) == "table" and value or {}
+end
+
+local function loadManualCategoryNames()
+    local value = store:readSetting("manual_category_names")
+    return type(value) == "table" and value or {}
+end
+
+local manual_book_categories = loadManualCategories()
+local manual_category_names = loadManualCategoryNames()
+
+local function saveManualCategories()
+    store:saveSetting("manual_book_categories", manual_book_categories)
+    store:saveSetting("manual_category_names", manual_category_names)
+    store:flush()
+end
+
 -- Showcase appearance is a separate namespace.  Shared book metadata is
 -- allowed, but cover/spine geometry from the bookshelf must never leak into
 -- the display cabinet.
@@ -459,6 +481,7 @@ local function openBookThroughFileManager(shelf, path)
     G_reader_settings:delSetting("simplebookshelf_return_page")
     G_reader_settings:saveSetting("simpleui_book_origin", "simplebookshelf")
     G_reader_settings:saveSetting("simplebookshelf_return_tab", shelf and shelf.tab or "bookshelf")
+    G_reader_settings:saveSetting("simplebookshelf_last_opened_path", path)
     UIManager._simpleui_book_origin = "simplebookshelf"
     G_reader_settings:flush()
     logger.info("simplebookshelf: opening through FileManager", path)
@@ -563,10 +586,28 @@ end
 -- This deliberately does not depend on SimpleUI: SimpleUI's cover cache/API
 -- may be absent or return nil on KPW6 even when the EPUB metadata contains a
 -- valid cover.
-local COVER_CACHE_BYTE_BUDGET = 12 * 1024 * 1024
+local COVER_CACHE_BYTE_BUDGET = (function()
+    local total_kb = 0
+    local file = io.open("/proc/meminfo", "r")
+    if file then
+        local text = file:read("*a") or ""
+        file:close()
+        total_kb = tonumber(text:match("MemTotal:%s+(%d+)%s+kB")) or 0
+    end
+    if total_kb > 0 and total_kb <= 384 * 1024 then return 4 * 1024 * 1024 end
+    if total_kb > 0 and total_kb <= 640 * 1024 then return 6 * 1024 * 1024 end
+    if total_kb > 0 and total_kb <= 1152 * 1024 then return 8 * 1024 * 1024 end
+    return 12 * 1024 * 1024
+end)()
 local cover_widget_cache = {}
-local cover_cache_order = {}
-local cover_cache_bytes = 0
+-- Separate bounded LRUs: full covers must not evict narrow/custom spines.
+local cover_cache_pools = {
+    covers = {order={}, bytes=0}, spines = {order={}, bytes=0},
+}
+local function coverCachePool(key)
+    return cover_cache_pools[(key:sub(1, 5) == "crop\0" or key:sub(1, 7) == "custom\0")
+        and "spines" or "covers"]
+end
 -- Cover extraction opens the document provider and can take hundreds of
 -- milliseconds on low-power Kindles. Cache the already-scaled thumbnail,
 -- never the original multi-megapixel cover, and run one extraction per UI
@@ -577,7 +618,7 @@ local cover_loader_running = false
 
 local function coverCacheKey(path, w, h)
     path = tostring(path or ""):gsub("^file://", "")
-    local mtime = tonumber(lfs.attributes(path, "modification")) or 0
+    local mtime = tonumber((lfs.attributes(path, "modification"))) or 0
     return path .. "\0" .. tostring(math.max(1, w)) .. "x" .. tostring(math.max(1, h)) .. "@" .. tostring(mtime), path
 end
 
@@ -593,6 +634,7 @@ local function coverBufferBytes(bb)
 end
 
 local function touchCoverCacheKey(key)
+    local cover_cache_order = coverCachePool(key).order
     for i, cached_key in ipairs(cover_cache_order) do
         if cached_key == key then table.remove(cover_cache_order, i); break end
     end
@@ -600,17 +642,18 @@ local function touchCoverCacheKey(key)
 end
 
 local function putCoverThumbnail(key, bb)
+    local pool = coverCachePool(key)
     local previous = cover_widget_cache[key]
-    if previous then cover_cache_bytes = math.max(0, cover_cache_bytes - coverBufferBytes(previous)) end
+    if previous then pool.bytes = math.max(0, pool.bytes - coverBufferBytes(previous)) end
     cover_widget_cache[key] = bb
-    cover_cache_bytes = cover_cache_bytes + coverBufferBytes(bb)
+    pool.bytes = pool.bytes + coverBufferBytes(bb)
     touchCoverCacheKey(key)
-    while cover_cache_bytes > COVER_CACHE_BYTE_BUDGET and #cover_cache_order > 1 do
-        local oldest = table.remove(cover_cache_order, 1)
+    while pool.bytes > COVER_CACHE_BYTE_BUDGET and #pool.order > 1 do
+        local oldest = table.remove(pool.order, 1)
         local evicted = cover_widget_cache[oldest]
         cover_widget_cache[oldest] = nil
         cover_load_state[oldest] = nil
-        cover_cache_bytes = math.max(0, cover_cache_bytes - coverBufferBytes(evicted))
+        pool.bytes = math.max(0, pool.bytes - coverBufferBytes(evicted))
         -- Drop our reference only. A just-painted ImageWidget may still own a
         -- live reference until the current repaint has fully unwound.
     end
@@ -802,18 +845,83 @@ local function getBookSpineWidget(path, w, h, align, cache_only)
     return ok_widget and widget or nil
 end
 
+local function customSpineWidget(path, w, h, fit, cache_only)
+    if not path or lfs.attributes(path, "mode") ~= "file" then return nil end
+    local base_key, clean_path = coverCacheKey(path, w, h)
+    local key = "custom\0" .. base_key .. "\0" .. tostring(fit or "crop")
+    local cached = cover_widget_cache[key]
+    local ImageWidget = require("ui/widget/imagewidget")
+    if cached then
+        touchCoverCacheKey(key)
+        local ok_cached, cached_widget = pcall(ImageWidget.new, ImageWidget, {
+            image=cached, image_disposable=false,
+            width=math.max(1, w), height=math.max(1, h), scale_factor=1,
+        })
+        if ok_cached and cached_widget then return cached_widget end
+    end
+    if cache_only then return nil end
+    local ok, widget = pcall(function()
+        -- Do not probe/render the original phone photo first. ImageWidget's
+        -- scale_factor path decodes the native image and only then scales it,
+        -- which can retain several multi-megapixel buffers on Scribe. Passing
+        -- the target dimensions makes RenderImage downsample during decode.
+        -- The shelf card is narrow enough that the tiny aspect-ratio tradeoff
+        -- is preferable to a memory spike and keeps all uploaded formats safe.
+        return ImageWidget:new{
+            file=clean_path, width=w, height=h, alpha=true, file_do_cache=false,
+        }
+    end)
+    if not ok or not widget then return nil end
+    local ok_render = pcall(widget._render, widget)
+    local image = ok_render and widget._bb or nil
+    if not image then
+        if widget.free then widget:free() end
+        return nil
+    end
+    -- Keep the decoded, already-sized image in the plugin cache.  Detach it
+    -- from the temporary file widget before freeing that widget.
+    widget._bb_disposable = false
+    putCoverThumbnail(key, image)
+    if widget.free then widget:free() end
+    local ok_cached, cached_widget = pcall(ImageWidget.new, ImageWidget, {
+        image=image, image_disposable=false,
+        width=math.max(1, w), height=math.max(1, h), scale_factor=1,
+    })
+    return ok_cached and cached_widget or nil
+end
+
 local function runNextShowcaseCoverLoad()
     local item = table.remove(cover_load_queue, 1)
     if not item then
         cover_loader_running = false
         return
     end
+    local widget
     if cover_load_state[item.key] == "pending" then
-        local widget = getBookCoverWidget(item.path, item.w, item.h, "center")
+        if item.spine then
+            if item.custom then
+                widget = customSpineWidget(item.path, item.w, item.h, item.align, false)
+            else
+                widget = getBookSpineWidget(item.path, item.w, item.h, item.align, false)
+            end
+            cover_load_state[item.key] = widget and "ready" or "missing"
+        else
+            widget = getBookCoverWidget(item.path, item.w, item.h, "center")
+        end
         if widget and widget.free then widget:free() end
     end
     local shelf = item.shelf
-    if shelf and shelf._showcase_cover_pending then
+    if item.spine and shelf and shelf._bookshelf_spine_pending then
+        local page = item.page or 1
+        local remaining = math.max(0, (shelf._bookshelf_spine_pending[page] or 1) - 1)
+        shelf._bookshelf_spine_pending[page] = remaining > 0 and remaining or nil
+        if remaining == 0 and shelf == Shelf.instance then
+            shelf:invalidateBookshelfPageCache()
+            if shelf.tab == "bookshelf" and (shelf.page or 1) == page then
+                UIManager:setDirty(shelf, "ui")
+            end
+        end
+    elseif shelf and shelf._showcase_cover_pending then
         local page = item.page or 1
         local remaining = math.max(0, (shelf._showcase_cover_pending[page] or 1) - 1)
         shelf._showcase_cover_pending[page] = remaining > 0 and remaining or nil
@@ -826,7 +934,8 @@ local function runNextShowcaseCoverLoad()
             UIManager:setDirty(shelf, "ui")
         end
     end
-    UIManager:scheduleIn(.03, runNextShowcaseCoverLoad)
+    UIManager:scheduleIn(COVER_CACHE_BYTE_BUDGET <= 6 * 1024 * 1024 and .08 or .04,
+        runNextShowcaseCoverLoad)
 end
 
 local function queueShowcaseCoverLoad(shelf, path, w, h, rect)
@@ -843,14 +952,22 @@ local function queueShowcaseCoverLoad(shelf, path, w, h, rect)
     }
     if not cover_loader_running then
         cover_loader_running = true
-        UIManager:scheduleIn(.03, runNextShowcaseCoverLoad)
+        UIManager:scheduleIn(COVER_CACHE_BYTE_BUDGET <= 6 * 1024 * 1024 and .08 or .04,
+            runNextShowcaseCoverLoad)
     end
 end
 
 local home_crop_queue, home_crop_pending, home_crop_running = {}, {}, false
+local home_cover_queue, home_cover_pending, home_cover_running = {}, {}, false
 local function runNextHomeCropLoad()
     local item = table.remove(home_crop_queue, 1)
-    if not item then home_crop_running = false; return end
+    if not item then
+        home_crop_running = false
+        if not home_cover_running and Shelf.instance and Shelf.instance.tab == "home" then
+            UIManager:setDirty(Shelf.instance, "ui")
+        end
+        return
+    end
     local widget = getBookSpineWidget(item.path, item.w, item.h, item.align, false)
     home_crop_pending[item.key] = nil
     if item.shelf and item.shelf == Shelf.instance and item.shelf.tab == "home" and item.rect then
@@ -858,10 +975,9 @@ local function runNextHomeCropLoad()
         if widget and cached and cached.bb and item.generation == (item.shelf._home_render_generation or 0) then
             pcall(widget.paintTo, widget, cached.bb, item.rect.x, item.rect.y)
         end
-        UIManager:setDirty(item.shelf, function() return "ui", item.rect, false end)
     end
     if widget and widget.free then widget:free() end
-    UIManager:scheduleIn(.03, runNextHomeCropLoad)
+    UIManager:scheduleIn(.06, runNextHomeCropLoad)
 end
 
 local function queueHomeCropLoad(shelf, path, w, h, align, rect)
@@ -876,14 +992,19 @@ local function queueHomeCropLoad(shelf, path, w, h, align, rect)
     }
     if not home_crop_running then
         home_crop_running = true
-        UIManager:scheduleIn(.03, runNextHomeCropLoad)
+        UIManager:scheduleIn(.06, runNextHomeCropLoad)
     end
 end
 
-local home_cover_queue, home_cover_pending, home_cover_running = {}, {}, false
 local function runNextHomeCoverLoad()
     local item = table.remove(home_cover_queue,1)
-    if not item then home_cover_running=false; return end
+    if not item then
+        home_cover_running=false
+        if not home_crop_running and Shelf.instance and Shelf.instance.tab=="home" then
+            UIManager:setDirty(Shelf.instance,"ui")
+        end
+        return
+    end
     local widget=getBookCoverWidget(item.path,item.w,item.h,item.align,false)
     home_cover_pending[item.key]=nil
     if item.shelf and item.shelf==Shelf.instance and item.shelf.tab=="home" and item.rect then
@@ -891,10 +1012,9 @@ local function runNextHomeCoverLoad()
         if widget and cached and cached.bb and item.generation==(item.shelf._home_render_generation or 0) then
             pcall(widget.paintTo,widget,cached.bb,item.rect.x,item.rect.y)
         end
-        UIManager:setDirty(item.shelf,function() return "ui",item.rect,false end)
     end
     if widget and widget.free then widget:free() end
-    UIManager:scheduleIn(.03,runNextHomeCoverLoad)
+    UIManager:scheduleIn(.06,runNextHomeCoverLoad)
 end
 
 local function queueHomeCoverLoad(shelf,path,w,h,align,rect)
@@ -902,7 +1022,7 @@ local function queueHomeCoverLoad(shelf,path,w,h,align,rect)
     if clean_path=="" or home_cover_pending[key] or cover_widget_cache[key] or cover_load_state[key]=="missing" then return end
     home_cover_pending[key]=true
     home_cover_queue[#home_cover_queue+1]={key=key,path=clean_path,w=math.max(1,w),h=math.max(1,h),align=align or "center",shelf=shelf,rect=rect,generation=shelf and shelf._home_render_generation or 0}
-    if not home_cover_running then home_cover_running=true; UIManager:scheduleIn(.03,runNextHomeCoverLoad) end
+    if not home_cover_running then home_cover_running=true; UIManager:scheduleIn(.06,runNextHomeCoverLoad) end
 end
 
 local function updateShowcaseBookStyle(path, key, value)
@@ -966,17 +1086,28 @@ local function drawText(bb, value, x, y, size, bold, max_width, color)
     widget:free()
 end
 
+-- PERF: the four navbar icons are static SVGs, yet paintNavbar runs on every
+-- shelf/home/stats/showcase repaint (page swipes, clock ticks, cover loads).
+-- Re-parsing the SVG and allocating a fresh ImageWidget each time is a real
+-- cost on e-ink.  Parse + rasterize once per (filename,size) and keep the
+-- widget around; later paints just blit it.  At most a handful of small icons
+-- live in this cache, so the memory cost is negligible.
+local _plugin_icon_cache = setmetatable({}, { __mode = "v" })
 local function drawPluginIcon(bb, filename, x, y, size)
     local ImageWidget = require("ui/widget/imagewidget")
-    local path = PLUGIN_DIR .. "/train-icons-svg/" .. filename
-    if not lfs.attributes(path, "mode") then return end
-    local ok, widget = pcall(function()
-        return ImageWidget:new{file=path, width=size, height=size, alpha=true, file_do_cache=false}
-    end)
-    if ok and widget then
-        pcall(widget.paintTo, widget, bb, x, y)
-        if widget.free then widget:free() end
+    local key = filename .. "@" .. tostring(size)
+    local widget = _plugin_icon_cache[key]
+    if not widget then
+        local path = PLUGIN_DIR .. "/train-icons-svg/" .. filename
+        if not lfs.attributes(path, "mode") then return end
+        local ok, w = pcall(function()
+            return ImageWidget:new{file=path, width=size, height=size, alpha=true}
+        end)
+        if not ok or not w then return end
+        widget = w
+        _plugin_icon_cache[key] = widget
     end
+    pcall(widget.paintTo, widget, bb, x, y)
 end
 
 local function drawCenteredText(bb, value, x, y, size, bold, width, color)
@@ -1081,6 +1212,39 @@ local function selectedBookMetadata(data)
     return table.concat(parts, " ")
 end
 
+local function trimCategory(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function selectedBookCategories(data)
+    local result, seen = {}, {}
+    local function add(value)
+        if type(value) == "table" then
+            for _, item in pairs(value) do add(item) end
+            return
+        end
+        if value == nil then return end
+        for part in tostring(value):gmatch("[^,;|/，；、]+") do
+            local label = trimCategory(part)
+            local key = label:lower()
+            -- Descriptions and malformed metadata sometimes leak whole
+            -- sentences into a category field.  Keep the chooser compact.
+            if label ~= "" and #label <= 72 and not seen[key] then
+                seen[key] = true
+                result[#result + 1] = label
+            end
+        end
+    end
+    for _, key in ipairs({
+        "tags", "tag", "keywords", "keyword", "subjects", "subject",
+        "categories", "category", "genre", "genres",
+    }) do
+        add(data[key])
+    end
+    table.sort(result, function(a, b) return a:lower() < b:lower() end)
+    return result
+end
+
 local function bookInfo(path, history_map)
     local book = {
         path = path,
@@ -1088,9 +1252,11 @@ local function bookInfo(path, history_map)
         authors = "",
         language = "",
         metadata_text = "",
+        metadata_categories = {},
         percent = 0,
         status = 2,
         added = lfs.attributes(path, "modification") or 0,
+        file_size = lfs.attributes(path, "size") or 0,
         last_read = history_map[path] or 0,
         pages = 0,
     }
@@ -1102,6 +1268,7 @@ local function bookInfo(path, history_map)
             book.authors = data.authors or data.author or ""
             book.language = tostring(data.language or data.lang or data.book_language or data.dc_language or "")
             book.metadata_text = selectedBookMetadata(data)
+            book.metadata_categories = selectedBookCategories(data)
             book.percent = data.percent or 0
             book.pages = tonumber(data.pages or data.total_pages or data.page_count or data.doc_pages) or 0
         end
@@ -1122,6 +1289,9 @@ local function bookInfo(path, history_map)
             pcall(function() settings:close() end)
         end
     end
+    -- Keep the metadata/file title so a cleared display-name override can be
+    -- restored without rescanning or touching the document itself.
+    book.source_title = book.title
     local ov = book_overrides[book.path]
     if ov and ov.title_override and ov.title_override ~= "" then book.title = ov.title_override end
     return book
@@ -1227,9 +1397,13 @@ local function scanBooks(root)
     return result
 end
 
-local function scanBooksAsync(root, done)
+local function scanBooksAsync(root, existing_books, refresh_existing, done)
     local DocumentRegistry = require("document/documentregistry")
     local result, hmap = {}, historyMap()
+    local existing = {}
+    for _, book in ipairs(existing_books or {}) do
+        if book and book.path then existing[book.path] = book end
+    end
     local processed = 0
     local function walk(directory, depth)
         if depth > globalSetting("scan_depth") then return end
@@ -1242,10 +1416,21 @@ local function scanBooksAsync(root, done)
                 if mode == "directory" then
                     walk(path, depth + 1)
                 elseif mode == "file" and DocumentRegistry:hasProvider(path) then
-                    result[#result + 1] = bookInfo(path, hmap)
+                    local mtime = lfs.attributes(path, "modification") or 0
+                    local file_size = lfs.attributes(path, "size") or 0
+                    local old = existing[path]
+                    if not refresh_existing and old
+                            and tonumber(old.added) == tonumber(mtime)
+                            and tonumber(old.file_size) == tonumber(file_size) then
+                        result[#result + 1] = old
+                    else
+                        local book = bookInfo(path, hmap)
+                        book.file_size = file_size
+                        result[#result + 1] = book
+                    end
                 end
                 processed = processed + 1
-                if processed % 8 == 0 then coroutine.yield() end
+                if processed % 4 == 0 then coroutine.yield() end
             end
         end
     end
@@ -1260,7 +1445,7 @@ local function scanBooksAsync(root, done)
             done(nil)
             return
         end
-        if coroutine.status(worker) ~= "dead" then UIManager:scheduleIn(.02, step) end
+        if coroutine.status(worker) ~= "dead" then UIManager:scheduleIn(.05, step) end
     end
     UIManager:nextTick(step)
 end
@@ -1285,16 +1470,17 @@ local function booksSignature(books)
     local parts = {}
     for _, book in ipairs(books or {}) do
         parts[#parts + 1] = table.concat({
-            book.path or "", book.added or 0, book.last_read or 0,
+            book.path or "", book.added or 0, book.file_size or 0, book.last_read or 0,
             book.status or 0, book.percent or 0, book.pages or 0, book.title or "",
+            table.concat(book.metadata_categories or {}, "\29"),
         }, "\31")
     end
     table.sort(parts)
     return table.concat(parts, "\30")
 end
 
-local function sortBooks(books)
-    local mode = globalSetting("sort_mode")
+local function sortBooks(books, mode)
+    mode = mode or globalSetting("sort_mode")
     table.sort(books, function(a, b)
         if mode == "title" then return a.title:lower() < b.title:lower() end
         if mode == "added" then return a.added == b.added and a.title < b.title or a.added > b.added end
@@ -1442,21 +1628,28 @@ local function paintShelfEdgeHighlight(bb, x, y, w, level)
     end
 end
 
-local function customSpineWidget(path, w, h, fit)
-    if not path or lfs.attributes(path, "mode") ~= "file" then return nil end
-    local ImageWidget = require("ui/widget/imagewidget")
-    local ok, widget = pcall(function()
-        -- Do not probe/render the original phone photo first. ImageWidget's
-        -- scale_factor path decodes the native image and only then scales it,
-        -- which can retain several multi-megapixel buffers on Scribe. Passing
-        -- the target dimensions makes RenderImage downsample during decode.
-        -- The shelf card is narrow enough that the tiny aspect-ratio tradeoff
-        -- is preferable to a memory spike and keeps all uploaded formats safe.
-        return ImageWidget:new{
-            file=path, width=w, height=h, alpha=true, file_do_cache=false,
-        }
-    end)
-    return ok and widget or nil
+local function listHasCategory(list, wanted)
+    local key = tostring(wanted or ""):lower()
+    for _, value in ipairs(type(list) == "table" and list or {}) do
+        if tostring(value):lower() == key then return true end
+    end
+    return false
+end
+
+local function manualCategoriesForBook(path)
+    local value = manual_book_categories[path]
+    return type(value) == "table" and value or {}
+end
+
+local function bookMatchesCollection(book, filter, root)
+    if type(filter) ~= "table" or filter.kind == nil or filter.kind == "all" then return true end
+    if filter.kind == "manual" then return listHasCategory(manualCategoriesForBook(book.path), filter.value) end
+    if filter.kind == "uncategorized" then
+        return #manualCategoriesForBook(book.path) == 0
+    end
+    -- Older test builds persisted folder/metadata/smart filters. Treat those
+    -- as "all" now that classification is deliberately virtual and manual.
+    return true
 end
 
 
@@ -1562,6 +1755,16 @@ function ShelfCanvas:paintTo(bb, origin_x, origin_y)
     owner:paintWallpaper(bb, origin_x, origin_y)
     owner.hit_books = {}
     if owner.tab == "bookshelf" then
+        local cached = owner._bookshelf_page_cache
+        if cached and cached.bb and cached.key == owner:bookshelfPageCacheKey() then
+            local full_height = self.height or (height + NAVBAR_HEIGHT)
+            if pcall(bb.blitFrom, bb, cached.bb, origin_x, origin_y, 0, 0, width, full_height) then
+                owner:populateBookshelfHits(origin_x, origin_y)
+                return
+            end
+        end
+    end
+    if owner.tab == "bookshelf" then
         local rows = math.max(1, math.min(5, globalSetting("shelf_rows") or 3))
         local row_height = math.floor(height / rows)
         local shelf_shadow, shelf_soft, shelf_core, shelf_feather = dimensionalValues("shelf_3d_level")
@@ -1634,10 +1837,22 @@ function ShelfCanvas:paintTo(bb, origin_x, origin_y)
             bb:paintRect(x, y + style.corner, w, math.max(1, h - style.corner), BB.COLOR_GRAY_4)
         end
 
-        local cover = customSpineWidget(style.custom_spine, math.max(1, w - 4), math.max(1, h - 2), style.spine_fit)
+        local spine_w, spine_h = math.max(1, w - 4), math.max(1, h - 2)
+        local cover
+        if style.custom_spine then
+            cover = customSpineWidget(style.custom_spine, spine_w, spine_h, style.spine_fit, true)
+            if not cover and lfs.attributes(style.custom_spine, "mode") == "file" then
+                owner:queueBookshelfSpineLoad(style.custom_spine, spine_w, spine_h,
+                    style.spine_fit, true)
+            end
+        end
         if not cover then
-            cover = getBookSpineWidget(book.path,
-                math.max(1, w - 4), math.max(1, h - 2), style.crop_align)
+            cover = getBookSpineWidget(book.path, spine_w, spine_h, style.crop_align, true)
+            if not cover then
+                if not style.custom_spine or lfs.attributes(style.custom_spine, "mode") ~= "file" then
+                    owner:queueBookshelfSpineLoad(book.path, spine_w, spine_h, style.crop_align, false)
+                end
+            end
         end
         if cover then
             paintTopRoundedWidget(cover, bb, x + 2, y + 2, math.max(1, w - 4), math.max(1, h - 2), math.max(0, style.corner - 2))
@@ -1654,8 +1869,11 @@ function ShelfCanvas:paintTo(bb, origin_x, origin_y)
         local columns = math.max(1, math.floor((w - 8) / column_step))
         local visible_count = math.min(#letters, lines * columns)
         local used_columns = math.max(1, math.ceil(visible_count / lines))
-        local block_width = used_columns * column_step
-        local block_left = x + math.floor((w - block_width) / 2)
+    local block_width = used_columns * column_step
+    -- Font glyphs have a little more visual weight on the right than the
+    -- character cell calculation suggests, so nudge the title block left.
+    local title_center_shift = -math.max(4, math.floor(font_size * 0.45 + 0.5))
+    local block_left = x + math.floor((w - block_width) / 2) + title_center_shift
         local longest_column = math.min(lines, visible_count)
         local block_height = (longest_column - 1) * line_step + font_size
         local block_top = y + math.floor((h - block_height) / 2)
@@ -1678,11 +1896,170 @@ function ShelfCanvas:paintTo(bb, origin_x, origin_y)
         owner.hit_books[#owner.hit_books + 1] = { x=x, y=y, w=w, h=h, book=book }
     end
     owner:paintNavbar(bb, origin_x, origin_y + height, width)
+    if owner.tab == "bookshelf" then
+        owner:cacheBookshelfPage(bb, origin_x, origin_y)
+    end
 end
 
 Shelf = InputContainer:extend{ name = "simplebookshelf_window", covers_fullscreen = true }
 
+function Shelf:bookshelfPageCacheKey()
+    return table.concat({
+        tostring(self.page or 1),
+        tostring(self._bookshelf_render_generation or 0),
+        tostring(self.content_height or 0),
+    }, "|")
+end
+
+function Shelf:invalidateBookshelfPageCache()
+    local cached = self._bookshelf_page_cache
+    if cached and cached.bb and cached.bb.free then pcall(cached.bb.free, cached.bb) end
+    self._bookshelf_page_cache = nil
+end
+
+function Shelf:populateBookshelfHits(origin_x, origin_y)
+    self.hit_books = {}
+    for _, placement in ipairs((self.pages and self.pages[self.page]) or {}) do
+        self.hit_books[#self.hit_books + 1] = {
+            x=origin_x + placement.x, y=origin_y + placement.y,
+            w=placement.w, h=placement.h, book=placement.book,
+        }
+    end
+end
+
+function Shelf:cacheBookshelfPage(bb, origin_x, origin_y)
+    local width = self.canvas and self.canvas.width or Screen:getWidth()
+    local height = self.canvas and self.canvas.height or Screen:getHeight()
+    local ok, snapshot = pcall(BB.new, width, height, bb:getType())
+    if not ok or not snapshot then return end
+    local ok_blit = pcall(snapshot.blitFrom, snapshot, bb, 0, 0, origin_x, origin_y, width, height)
+    if not ok_blit then
+        if snapshot.free then snapshot:free() end
+        return
+    end
+    self:invalidateBookshelfPageCache()
+    self._bookshelf_page_cache = { key=self:bookshelfPageCacheKey(), bb=snapshot }
+end
+
+-- Directory polling is intentionally cheaper than a document scan: it only
+-- walks names, mtimes and sizes.  This lets an active shelf notice books
+-- copied in by USB/cloud tools without reopening every EPUB on every tick.
+-- PERF: ask lfs.attributes for the whole stat table once per entry instead of
+-- three separate syscalls (mode, modification, size).  On SD cards a full
+-- library walk fires every few seconds, so three stat() calls per file added
+-- up to a very noticeable background stall.  One stat() per entry keeps the
+-- fingerprint identical while cutting filesystem traffic by ~2/3.
+function Shelf:libraryFingerprint(root)
+    local parts = {}
+    local function walk(directory, depth)
+        if depth > globalSetting("scan_depth") then return end
+        local ok, iterator, state = pcall(lfs.dir, directory)
+        if not ok then return end
+        for name in iterator, state do
+            if name ~= "." and name ~= ".." and name ~= ".sdr" and name:sub(1, 1) ~= "." then
+                local path = directory .. "/" .. name
+                local attr = lfs.attributes(path)
+                if type(attr) ~= "table" then
+                    -- ignore unreadable entries
+                elseif attr.mode == "directory" then
+                    walk(path, depth + 1)
+                elseif attr.mode == "file" then
+                    parts[#parts + 1] = table.concat({
+                        path,
+                        tostring(attr.modification or 0),
+                        tostring(attr.size or 0),
+                    }, "\31")
+                end
+            end
+        end
+    end
+    walk(root, 0)
+    table.sort(parts)
+    return table.concat(parts, "\30")
+end
+
+function Shelf:startBookRefreshTimer()
+    if self._book_refresh_timer_running then return end
+    self._book_refresh_timer_running = true
+    local function tick()
+        if Shelf.instance ~= self then
+            self._book_refresh_timer_running = false
+            return
+        end
+        if not self._scan_running then
+            local current = self:libraryFingerprint(self.scan_root)
+            if current ~= self._last_filesystem_signature then
+                self._last_filesystem_signature = current
+                -- A changed directory should bypass the normal 180-second
+                -- progress-refresh throttle and reconcile immediately.
+                self._last_scan_at = nil
+                self:refreshBooks(false)
+            end
+        end
+        -- PERF: a full library stat walk is cheap now (one stat() per entry)
+        -- but still needless to repeat every few seconds. 15s is plenty to
+        -- notice USB/cloud-copied books without hogging the SD card.
+        UIManager:scheduleIn(15, tick)
+    end
+    UIManager:scheduleIn(15, tick)
+end
+
+function Shelf:queueBookshelfSpineLoad(path, w, h, align, custom)
+    local base_key, clean_path = coverCacheKey(path, w, h)
+    local key = (custom and "custom\0" or "crop\0") .. base_key .. "\0" .. tostring(align or "center")
+    if clean_path == "" or lfs.attributes(clean_path, "mode") ~= "file" or cover_widget_cache[key]
+            or cover_load_state[key] == "pending"
+            or cover_load_state[key] == "missing" then return end
+    cover_load_state[key] = "pending"
+    local page = self.page or 1
+    self._bookshelf_spine_pending = self._bookshelf_spine_pending or {}
+    self._bookshelf_spine_pending[page] = (self._bookshelf_spine_pending[page] or 0) + 1
+    cover_load_queue[#cover_load_queue + 1] = {
+        key=key, path=clean_path, w=math.max(1, w), h=math.max(1, h),
+        align=align or "center", shelf=self, page=page, spine=true, custom=custom,
+    }
+    if not cover_loader_running then
+        cover_loader_running = true
+        UIManager:scheduleIn(COVER_CACHE_BYTE_BUDGET <= 6 * 1024 * 1024 and .08 or .04,
+            runNextShowcaseCoverLoad)
+    end
+end
+
+function Shelf:getCollectionFilter()
+    local filter = self.collection_filter
+    local allowed = type(filter) == "table"
+        and (filter.kind == "all" or filter.kind == "manual" or filter.kind == "uncategorized")
+    if not allowed then
+        filter = {kind="all", value="", label="全部书籍"}
+        self.collection_filter = filter
+        store:saveSetting("active_collection_filter", filter)
+        store:flush()
+    end
+    return filter
+end
+
+function Shelf:visibleBooks()
+    local result, filter = {}, self:getCollectionFilter()
+    for _, book in ipairs(self.books or {}) do
+        if bookMatchesCollection(book, filter, self.scan_root) then result[#result + 1] = book end
+    end
+    return result
+end
+
+function Shelf:setCollectionFilter(filter)
+    self.collection_filter = filter or {kind="all", value="", label="全部书籍"}
+    store:saveSetting("active_collection_filter", self.collection_filter)
+    store:flush()
+    self.page = 1
+    self:refreshLayout()
+    UIManager:setDirty(self, "full")
+end
+
 function Shelf:buildPages()
+    -- Settings/metadata edits rebuild explicitly; ordinary tab changes do not.
+    self.showcase_pages = nil
+    self._bookshelf_render_generation = (self._bookshelf_render_generation or 0) + 1
+    self:invalidateBookshelfPageCache()
     self.pages = {}
     local screen_width = Screen:getWidth()
     local content_height = self.content_height
@@ -1698,7 +2075,7 @@ function Shelf:buildPages()
     local top_margin = math.floor(row_height * top_margin_pct[top_level])
     local gap = 3
     local page, row, cursor = {}, 1, left_margin
-    for _, book in ipairs(self.books) do
+    for _, book in ipairs(self:visibleBooks()) do
         local style = bookStyle(book.path, self.standalone)
         local scale = (globalSetting("book_scale") or 100) / 100
         local override = book_overrides[book.path]
@@ -1739,9 +2116,39 @@ function Shelf:init()
     self.disable_double_tap = globalSetting("book_open_mode") ~= "double"
     self.page = 1
     self.scan_root = libraryRoot()
+    self.collection_filter = store:readSetting("active_collection_filter")
+        or {kind="all", value="", label="全部书籍"}
     self.books = cachedBooks(self.scan_root)
+    local saved_scan = store:readSetting("scan_cache")
+    if type(saved_scan) == "table" and saved_scan.root == self.scan_root then
+        self._last_scan_at = tonumber(saved_scan.saved_at)
+    end
+    -- Returning from ReaderUI changes only the book that was just read. Update
+    -- that cached row instead of reopening every book's sidecar settings.
+    local last_opened = G_reader_settings:readSetting("simplebookshelf_last_opened_path")
+    if type(last_opened) == "string" and lfs.attributes(last_opened, "mode") == "file" then
+        local updated = bookInfo(last_opened, historyMap())
+        local replaced = false
+        for index, book in ipairs(self.books) do
+            if book.path == last_opened then self.books[index] = updated; replaced = true; break end
+        end
+        if replaced then
+            self._last_scan_at = os.time()
+            scan_cache[self.scan_root] = self.books
+            store:saveSetting("scan_cache", {
+                root=self.scan_root, books=self.books, saved_at=self._last_scan_at,
+            })
+            store:flush()
+        end
+    end
+    if last_opened then
+        G_reader_settings:delSetting("simplebookshelf_last_opened_path")
+        G_reader_settings:flush()
+    end
     sortBooks(self.books)
     self:buildPages()
+    self._last_filesystem_signature = self:libraryFingerprint(self.scan_root)
+    self:startBookRefreshTimer()
 
     self.canvas = ShelfCanvas:new{ width=Screen:getWidth(), height=Screen:getHeight(), owner=self }
     self.canvas.dimen = Geom:new{ w=Screen:getWidth(), h=Screen:getHeight() }
@@ -1836,7 +2243,6 @@ function Shelf:init()
     UIManager:scheduleIn(.25, function()
         if Shelf.instance == self then
             self:refreshBooks(false)
-            UIManager:setDirty(self, "full")
         end
     end)
 end
@@ -1853,10 +2259,13 @@ function Shelf:buildShowcasePages()
     local margin_left = math.max(8, tonumber(showcaseSetting("margin_left")) or 48)
     local margin_right = math.max(8, tonumber(showcaseSetting("margin_right")) or 48)
     local row_h = math.floor(height / rows)
-    local filter = self:getShowcaseFilter()
+    local filter = self:getCollectionFilter()
     local row, cursor = 1, margin_left
-    for _, book in ipairs(self.books or {}) do
-        if self:showcaseBookMatches(book, filter) then
+    local ordered = {}
+    for _, book in ipairs(self.books or {}) do ordered[#ordered + 1] = book end
+    sortBooks(ordered, showcaseSetting("sort_mode"))
+    for _, book in ipairs(ordered) do
+        if bookMatchesCollection(book, filter, self.scan_root) then
             local book_w, book_h = showcaseBookDimensions(book, row_h, scale)
             local lean, depth = showcaseBookProjection(book_h)
             local projected_w = book_w + lean + depth
@@ -2308,26 +2717,32 @@ local function homeBoardEnabled(key)
     return value == nil and (key == "current" or key == "recent" or key == "week" or key == "month") or value == true
 end
 
-function Shelf:homeBoardSlots()
-    local enabled = {}
-    for _, option in ipairs(HOME_BOARD_OPTIONS) do if homeBoardEnabled(option.key) then enabled[option.key] = true end end
-    local slots = {
-        enabled.current and "current" or nil,
-        enabled.recent and "recent" or nil,
-        enabled.week and "week" or nil,
-        enabled.month and "month" or nil,
-    }
-    local preferred = {random=1, notes=2, quote=3}
-    for _, key in ipairs({"random", "notes", "quote"}) do
-        if enabled[key] then
-            local target = preferred[key]
-            if slots[target] then
-                local empty
-                for i=1,4 do if not slots[i] then empty=i; break end end
-                target=empty or target
-            end
-            slots[target]=key
+function Shelf:homeBoardOrder()
+    local saved = store:readSetting("home_board_order")
+    local valid, result = {}, {}
+    for _, option in ipairs(HOME_BOARD_OPTIONS) do valid[option.key] = true end
+    if type(saved) == "table" then
+        for _, key in ipairs(saved) do
+            if valid[key] then result[#result + 1] = key; valid[key] = nil end
         end
+    end
+    for _, option in ipairs(HOME_BOARD_OPTIONS) do
+        if valid[option.key] then result[#result + 1] = option.key end
+    end
+    return result
+end
+
+Shelf.HOME_BOARD_DEFAULT_WEIGHT = {current=4, recent=3, week=2, month=2, quote=2, random=3, notes=2}
+
+function Shelf:homeBoardWeight(key)
+    local value = tonumber(store:readSetting("home_board_weight_" .. key))
+    return math.max(1, math.min(5, value or self.HOME_BOARD_DEFAULT_WEIGHT[key] or 2))
+end
+
+function Shelf:homeBoardSlots()
+    local slots = {}
+    for _, key in ipairs(self:homeBoardOrder()) do
+        if homeBoardEnabled(key) and #slots < 4 then slots[#slots + 1] = key end
     end
     return slots
 end
@@ -2532,7 +2947,7 @@ function Shelf:paintHomeV4(bb, x, y, width, height)
         R(80,py,890,ph,pale)
         if not key then return end
         local labels={quote="READING NOTE",random="随机发车",notes="票根笔记"}; local english={quote="",random="RANDOM DEPARTURE",notes="TICKET NOTES"}
-        drawPluginIcon(bb,"03-train-front.svg",X(94),Y(py+6),W(22)); T(labels[key] or key,124,py+10,12,true); if english[key] and english[key]~="" then T("· "..english[key],222,py+13,8,false) end; HR(94,py+31,862,1,mid)
+        drawPluginIcon(bb,"03-train-front.svg",X(94),Y(py+6),W(22)); T(labels[key] or key,124,py+8,10,true); if english[key] and english[key]~="" then T("· "..english[key],222,py+12,7,false) end; HR(94,py+31,862,1,mid)
         if key=="random" then
             if #recent==0 then CT("书库中还没有可发车的书",180,py+math.floor(ph*.48),680,12,false,mid); return end
             local index=(math.floor(os.time()/3600)%#recent)+1; local book=recent[index]
@@ -2581,6 +2996,9 @@ function Shelf:paintHomeV4(bb, x, y, width, height)
         end
     end
 
+    -- Legacy fixed-slot renderer retained as a reference while the active
+    -- path below distributes the full board area dynamically.
+    if false then
     -- Current reading: 365-630, with the exact reference columns.
     local cy=365
     self.home_hit_books={}
@@ -2648,6 +3066,143 @@ function Shelf:paintHomeV4(bb, x, y, width, height)
     local read_days=0; for d=1,31 do if (stats.month[d] or 0)>0 then read_days=read_days+1 end end; T("阅读天数 "..tostring(read_days).." →",870,my+10,9,false,86)
     for day=1,31 do local col=(day-1)%21; local row=math.floor((day-1)/21); local bx=103+col*40; local by=my+54+row*41; CT(tostring(day),bx-2,by-14,23,6,false); local fill=(stats.month[day] or 0)>0 and ((stats.month[day] or 0)>1800 and ink or BB.COLOR_GRAY_7) or paper; R(bx,by,19,19,fill); HR(bx,by,19,1,mid); HR(bx,by+18,19,1,mid); VR(bx,by,19,1,mid); VR(bx+18,by,19,1,mid) end
     else renderCustomPanel(board_slots[4],my,139) end
+    end
+
+    local board_labels = {
+        current={"正在阅读", "CURRENT READING"}, recent={"最近停靠", "RECENT STOPS"},
+        week={"本周线路", "WEEKLY LINE"}, month={"本月月台", "MONTH PLATFORM"},
+    }
+    local function boardHeader(key, py)
+        local labels=board_labels[key]
+        drawPluginIcon(bb,"03-train-front.svg",X(94),Y(py+6),W(22))
+        T(labels[1],124,py+8,10,true)
+        T("· "..labels[2],212,py+12,7,false)
+        HR(94,py+31,862,1,mid)
+    end
+    local function renderCurrentPanel(py,ph)
+        R(80,py,890,ph,pale); boardHeader("current",py)
+        if not current then CT("还没有正在阅读的书",180,py+math.floor(ph*.48),680,12,false,mid); return end
+        local growth=math.max(1,math.min(1.60,ph/265))
+        local metrics_h=ph>=220 and math.floor(math.max(62,math.min(125,ph*.22))) or 0
+        local bottom_pad=ph>=350 and math.floor(math.max(10,math.min(24,ph*.035))) or 5
+        local metric_y=py+ph-bottom_pad-metrics_h
+        local body_top=py+40; local body_bottom=metric_y-8
+        local body_h=math.max(72,body_bottom-body_top)
+        -- Treat cover/title/progress as one composition and center it in the
+        -- available body. Extra panel height becomes balanced top and bottom
+        -- breathing room instead of a single empty band in the middle.
+        local cover_h=math.max(68,math.min(320,math.floor(body_h*.72))); local cover_w=math.floor(cover_h*.72)
+        local cover_x=94; local cover_y=body_top+math.max(0,math.floor((body_h-cover_h)/2))
+        local cw,ch=W(cover_w),Ht(cover_h)
+        local cover=getBookCoverWidget(current.path,cw,ch,"center",true)
+        if cover then cover:paintTo(bb,X(cover_x),Y(cover_y)); if cover.free then cover:free() end
+        else queueHomeCoverLoad(self,current.path,cw,ch,"center",Geom:new{x=X(cover_x),y=Y(cover_y),w=cw,h=ch}) end
+        local continue_w=ph>=145 and 132 or 0
+        local text_x=cover_x+cover_w+20; local text_right=continue_w>0 and 805 or 950
+        local title_size=math.floor((ph>=250 and 19 or (ph>=180 and 16 or 13))*math.min(1.32,growth))
+        local title_y=cover_y+10
+        T(homeShortText(current.title or "未命名书籍",20),text_x,title_y,title_size,true,text_right-text_x-12)
+        local authors=tostring(current.authors or ""); if authors=="" then authors=stats.authors end
+        local author_size=math.floor(9*math.min(1.18,growth))
+        local author_y=title_y+math.floor(title_size*1.55)+7
+        if body_h>=110 then T(homeShortText(authors,35),text_x,author_y,author_size,false,text_right-text_x-12) end
+        local pct=math.max(0,math.min(100,math.floor((tonumber(current.percent) or 0)*100+.5)))
+        local pages=stats.pages>0 and stats.pages or 0; local current_page=pages>0 and math.floor(pages*pct/100+.5) or 0
+        -- The progress rails are physically tied to the cover's lower edge,
+        -- matching the ticket composition at every allocated panel height.
+        local progress_y=cover_y+cover_h-8
+        T("当前进度",text_x,progress_y-22,8,false); RT(tostring(pct).."%",text_right-4,progress_y-30,60,15,true)
+        HR(text_x,progress_y,text_right-text_x,1,ink); HR(text_x,progress_y+7,text_right-text_x,1,ink)
+        if pct>0 then R(text_x,progress_y+1,(text_right-text_x)*pct/100,6,ink) end
+        if pages>0 then RT(tostring(current_page).." / "..tostring(pages).." 页",text_right,progress_y+10,110,7,false,mid) end
+        if continue_w>0 then
+            VR(810,body_top,body_h,1,mid); local box_h=math.min(96,body_h-22); local box_y=cover_y+math.max(4,math.floor((cover_h-box_h)/2))
+            dashed(825,box_y,132,box_h,mid); CT("CONTINUE",825,box_y+12,132,8,false); CT("继续阅读",825,box_y+32,132,9,true); CT("▶",825,box_y+52,132,17,true)
+            addAction(825,box_y,132,box_h,function() openBookThroughFileManager(self,current.path) end)
+        end
+        self.home_hit_books[#self.home_hit_books+1]={x=X(cover_x),y=Y(cover_y),w=W(text_right-cover_x),h=Ht(cover_h),book=current}
+        if metrics_h>0 then
+            HR(94,py+ph-metrics_h,862,1,mid)
+            local remaining=(pct>0 and pct<100) and stats.total_seconds*(100-pct)/pct or 0
+            local metrics={{"已读时长",homeDuration(stats.total_seconds),"READING TIME"},{"预计剩余",homeDuration(remaining),"LEFT TIME"},{"阅读次数",tostring(stats.visits),"VISITS"},{"总页数",pages>0 and tostring(pages) or "—","PAGES"}}
+            local metric_value_size=metrics_h>=110 and 17 or (metrics_h>=80 and 14 or 12)
+            local metric_label_size=metrics_h>=110 and 10 or (metrics_h>=80 and 9 or 8)
+            local value_y=metric_y+math.floor(metrics_h*.22); local label_y=metric_y+math.floor(metrics_h*.58)
+            for i,item in ipairs(metrics) do local mx=103+(i-1)*219; if i>1 then VR(mx-15,metric_y+10,metrics_h-20,1,mid) end; metricIcon(i,mx,value_y+2); T(item[2],mx+29,value_y,metric_value_size,true,140); T(item[3].." · "..item[1],mx+29,label_y,metric_label_size,false,170,mid) end
+        end
+    end
+    local function renderRecentPanel(py,ph)
+        R(80,py,890,ph,pale); boardHeader("recent",py); T("查看更多 →",888,py+12,8,false,68)
+        local content_top=py+36; local content_bottom=py+ph-10
+        local available_group_h=math.max(102,content_bottom-content_top)
+        local group_h=math.min(230,available_group_h)
+        local group_y=content_top+math.max(0,math.floor((available_group_h-group_h)/2))
+        local card_h=math.max(82,group_h-20); local card_y=group_y
+        local rail_y=card_y+card_h+6
+        for i=1,math.min(5,#recent) do
+            local book=recent[i]; local bx=111+(i-1)*168
+            R(bx+4,card_y+5,158,card_h,BB.COLOR_GRAY_C); R(bx,card_y,158,card_h,paper)
+            HR(bx,card_y,158,1,ink); HR(bx,card_y+card_h,158,1,ink); VR(bx,card_y,card_h,1,mid); VR(bx+157,card_y,card_h,1,mid)
+            -- Reserve a compact footer for title/progress/date and give every
+            -- additional pixel to the cover crop. This avoids the tall empty
+            -- carriage body seen when a two-board layout receives more room.
+            local image_h=math.max(34,card_h-75); local crop_w,crop_h=W(141),Ht(image_h)
+            local cover=getBookSpineWidget(book.path,crop_w,crop_h,"center",true)
+            if cover then cover:paintTo(bb,X(bx+8),Y(card_y+8)); if cover.free then cover:free() end
+            else queueHomeCropLoad(self,book.path,crop_w,crop_h,"center",Geom:new{x=X(bx+8),y=Y(card_y+8),w=crop_w,h=crop_h}) end
+            local pct=math.max(0,math.floor((tonumber(book.percent) or 0)*100+.5)); local info_y=card_y+card_h-35
+            local title_y=info_y-20; CT(homeShortText(book.title or "",8),bx+9,title_y,140,8,true)
+            T(tostring(pct).."%",bx+13,info_y,7,true); HR(bx+48,info_y+7,72,2,mid); if pct>0 then HR(bx+48,info_y+7,72*pct/100,2,ink) end
+            if card_h>=112 and tonumber(book.last_read) and book.last_read>0 then CT("停靠 "..os.date("%m.%d",book.last_read),bx+23,card_y+card_h-17,112,6,false,mid) end
+            C(bx+29,rail_y,7,ink); C(bx+29,rail_y,3,paper); C(bx+129,rail_y,7,ink); C(bx+129,rail_y,3,paper)
+            self.home_hit_books[#self.home_hit_books+1]={x=X(bx),y=Y(card_y),w=W(158),h=Ht(card_h+8),book=book}
+        end
+        HR(103,rail_y,850,2,ink); HR(103,rail_y+7,850,1,mid)
+    end
+    local function renderWeekPanel(py,ph)
+        R(80,py,890,ph,pale); boardHeader("week",py)
+        local total,maxv=0,1; for i=1,7 do total=total+(stats.week[i] or 0); maxv=math.max(maxv,stats.week[i] or 0) end
+        T("本周时长 "..homeDuration(total).." →",851,py+11,9,false,105)
+        -- On a tall single-board layout, keep the chart large while lifting the
+        -- whole axis enough to leave a calm footer. Compact layouts receive a
+        -- proportionally smaller lift so the graph remains useful.
+        local top_blank=math.max(42,math.min(66,math.floor(ph*.08)))
+        local bottom_blank=math.max(30,math.min(105,math.floor(ph*.13)))
+        local timeline_y=py+ph-bottom_blank
+        local graph_top=py+top_blank
+        local graph_bottom=math.max(graph_top+20,timeline_y-43)
+        local pts={}; for i=1,7 do pts[i]={x=104+(i-1)*140,y=graph_bottom-(graph_bottom-graph_top)*(stats.week[i] or 0)/maxv} end
+        for i=2,7 do local a,b=pts[i-1],pts[i]; for px=a.x,b.x,3 do local q=(px-a.x)/(b.x-a.x); local gy=a.y+(b.y-a.y)*q; R(px,gy,2,graph_bottom-gy,BB.COLOR_GRAY_C) end; L(a.x,a.y,b.x,b.y,1.4,BB.COLOR_GRAY_4) end
+        HR(103,graph_bottom,854,1,mid); HR(132,timeline_y,784,1,ink)
+        for i=1,7 do local px=159+(i-1)*122; CT(({"MON","TUE","WED","THU","FRI","SAT","SUN"})[i],px-34,timeline_y-28,68,8,true); C(px,timeline_y,8,ink); C(px,timeline_y,4,(stats.week[i] or 0)>0 and ink or paper); CT(homeDuration(stats.week[i] or 0),px-38,timeline_y+13,76,7,false,mid) end
+    end
+    local function renderMonthPanel(py,ph)
+        R(80,py,890,ph,pale); boardHeader("month",py)
+        local read_days=0; for d=1,31 do if (stats.month[d] or 0)>0 then read_days=read_days+1 end end
+        T("阅读天数 "..tostring(read_days).." →",870,py+10,9,false,86)
+        local grid_h=math.max(45,ph-39); local row_gap=math.max(27,math.min(48,math.floor(grid_h/2))); local first_y=py+42+math.max(0,math.floor((grid_h-row_gap*2)/2))
+        for day=1,31 do local col=(day-1)%21; local row=math.floor((day-1)/21); local bx=103+col*40; local by=first_y+row*row_gap; CT(tostring(day),bx-2,by-12,23,6,false); local fill=(stats.month[day] or 0)>0 and ((stats.month[day] or 0)>1800 and ink or BB.COLOR_GRAY_7) or paper; R(bx,by,19,19,fill); HR(bx,by,19,1,mid); HR(bx,by+18,19,1,mid); VR(bx,by,19,1,mid); VR(bx+18,by,19,1,mid) end
+    end
+    local function renderBoard(key,py,ph)
+        if key=="current" then renderCurrentPanel(py,ph)
+        elseif key=="recent" then renderRecentPanel(py,ph)
+        elseif key=="week" then renderWeekPanel(py,ph)
+        elseif key=="month" then renderMonthPanel(py,ph)
+        else renderCustomPanel(key,py,ph) end
+    end
+
+    self.home_hit_books={}
+    local area_y,area_h,gap=365,776,5
+    local minimum={current=155,recent=145,week=120,month=110,random=145,notes=110,quote=105}
+    local min_total,weight_total=gap*math.max(0,#board_slots-1),0
+    for _,key in ipairs(board_slots) do min_total=min_total+(minimum[key] or 105); weight_total=weight_total+self:homeBoardWeight(key) end
+    local remaining=math.max(0,area_h-min_total); local at=area_y; local used=0
+    for index,key in ipairs(board_slots) do
+        local ph
+        if index==#board_slots then ph=area_h-used-gap*(#board_slots-1)
+        else ph=(minimum[key] or 105)+math.floor(remaining*self:homeBoardWeight(key)/math.max(1,weight_total)) end
+        renderBoard(key,at,ph); at=at+ph+gap; used=used+ph
+    end
     self.hit_books=self.home_hit_books
 end
 
@@ -2699,13 +3254,24 @@ end
 function Shelf:setTab(tab)
     if tab ~= "home" and tab ~= "bookshelf" and tab ~= "stats" and tab ~= "showcase" then return end
     if not navigationTabEnabled(tab) then return end
+    if self.tab == tab then return true end
     local perf_started = os.clock()
+    self._tab_pages = self._tab_pages or {}
+    self._tab_pages[self.tab] = self.page or 1
     self.tab = tab
+    self.page = self._tab_pages[tab] or 1
     self.hit_books = {}
     if tab=="home" then self:startHomeClockRefresh() end
-    if tab == "bookshelf" then self:buildPages()
-    elseif tab == "showcase" then self:buildShowcasePages() end
-    UIManager:setDirty(self, "full")
+    if tab == "bookshelf" then
+        if not self.pages then self:buildPages() end
+        self.page_num = #self.pages
+        self.page = math.max(1, math.min(self.page, self.page_num))
+    elseif tab == "showcase" then
+        if not self.showcase_pages then self:buildShowcasePages() end
+        self.page_num = #self.showcase_pages
+        self.page = math.max(1, math.min(self.page, self.page_num))
+    end
+    UIManager:setDirty(self, "ui")
     local perf_elapsed = os.clock() - perf_started
     if perf_elapsed >= 0.2 then
         logger.info("simplebookshelf: setTab", tab, "elapsed", string.format("%.3fs", perf_elapsed))
@@ -2739,10 +3305,20 @@ end
 function Shelf:showHomeSettings()
     local Menu = require("ui/widget/menu")
     local menu
-    local items = {}
+    local owner=self
+    local labels={}; for _,option in ipairs(HOME_BOARD_OPTIONS) do labels[option.key]=option.label end
+    local function repaintAndReopen()
+        store:flush()
+        owner:invalidateHomeRenderCache()
+        refreshTopMenu()
+        UIManager:setDirty(owner,"full")
+        if menu then UIManager:close(menu) end
+        owner:showHomeSettings()
+    end
+    local selection_items = {}
     for _, option in ipairs(HOME_BOARD_OPTIONS) do
         local saved = option.key
-        items[#items + 1] = {
+        selection_items[#selection_items + 1] = {
             text_func=function() return (homeBoardEnabled(saved) and "☑ " or "□ ") .. option.label end,
             callback=function()
                 local enabled = homeBoardEnabled(saved)
@@ -2753,14 +3329,52 @@ function Shelf:showHomeSettings()
                 elseif count >= 4 then
                     return
                 end
-                store:saveSetting("home_board_" .. saved, not enabled); store:flush()
-                self:invalidateHomeRenderCache()
-                refreshTopMenu()
-                UIManager:setDirty(self, "full")
+                store:saveSetting("home_board_" .. saved, not enabled)
+                repaintAndReopen()
             end,
         }
     end
-    menu = Menu:new{title="阅读主页看板", item_table=items, width=math.floor(Screen:getWidth() * .72), height=math.floor(Screen:getHeight() * .58), items_font_size=PLUGIN_MENU_FONT_SIZE, items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE}
+    local function moveEnabled(key,delta)
+        local enabled,disabled={},{}
+        for _,saved in ipairs(owner:homeBoardOrder()) do
+            if homeBoardEnabled(saved) then enabled[#enabled+1]=saved else disabled[#disabled+1]=saved end
+        end
+        local at=1; for i,saved in ipairs(enabled) do if saved==key then at=i; break end end
+        local target=math.max(1,math.min(#enabled,at+delta))
+        if target~=at then enabled[at],enabled[target]=enabled[target],enabled[at] end
+        for _,saved in ipairs(disabled) do enabled[#enabled+1]=saved end
+        store:saveSetting("home_board_order",enabled)
+        repaintAndReopen()
+    end
+    local layout_items={}
+    local enabled_order=self:homeBoardSlots()
+    for index,key in ipairs(enabled_order) do
+        local saved,key_index=key,index
+        local controls={
+            {text="↑ 上移",enabled_func=function() return key_index>1 end,callback=function() moveEnabled(saved,-1) end},
+            {text="↓ 下移",enabled_func=function() return key_index<#enabled_order end,callback=function() moveEnabled(saved,1) end},
+        }
+        for weight=1,5 do
+            local saved_weight=weight
+            controls[#controls+1]={
+                text="占比 "..saved_weight.." 份",
+                checked_func=function() return owner:homeBoardWeight(saved)==saved_weight end,
+                callback=function()
+                    store:saveSetting("home_board_weight_"..saved,saved_weight)
+                    repaintAndReopen()
+                end,
+            }
+        end
+        layout_items[#layout_items+1]={
+            text_func=function() return tostring(key_index).." · "..tostring(labels[saved] or saved).."  ·  "..owner:homeBoardWeight(saved).." 份" end,
+            sub_item_table=controls,
+        }
+    end
+    local items={
+        {text="启用看板（1–4 个）",sub_item_table=selection_items},
+        {text="排序与占比",sub_item_table=layout_items},
+    }
+    menu = Menu:new{title="阅读主页看板", item_table=items, width=math.floor(Screen:getWidth() * .76), height=math.floor(Screen:getHeight() * .66), items_font_size=PLUGIN_MENU_FONT_SIZE, items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE}
     standardizePluginMenu(menu); UIManager:show(menu)
 end
 
@@ -2919,18 +3533,24 @@ function Shelf:showShowcaseSettings()
             {text="选择壁纸", sub_item_table=wallpaper_items},
             {text="填充方式", sub_item_table=fit_items},
         }},
+        {text="批量删除书籍", callback=function()
+            UIManager:close(menu)
+            self:showBatchDeleteMenu()
+        end},
     }, x=geometry.x, y=geometry.y, width=geometry.width, height=geometry.height}
     standardizePluginMenu(menu); UIManager:show(menu, nil, nil, geometry.x, geometry.y)
 end
 
 function Shelf:getShowcaseFilter()
-    -- The showcase is a visual browsing surface, not a second category
-    -- browser. Always show the complete collection, including when an older
-    -- plugin version left a saved filter behind.
-    return {label="全部书籍", kind="all", value=""}
+    return self:getCollectionFilter()
 end
 
 function Shelf:showcaseBookMatches(book, filter)
+    if filter and (filter.kind == "folder" or filter.kind == "metadata"
+            or filter.kind == "manual" or filter.kind == "uncategorized"
+            or filter.kind == "smart") then
+        return bookMatchesCollection(book, filter, self.scan_root)
+    end
     if not filter or filter.kind == "all" then return true end
     if filter.kind == "language" then
         return bookLanguage(book) == filter.value
@@ -3036,9 +3656,106 @@ local function rlBoardings(rows)
     return result
 end
 
+local function rlBoardingCaption(count)
+    count = math.max(0, math.floor(tonumber(count) or 0))
+    local words = {
+        [0]="NO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN",
+        "EIGHT", "NINE", "TEN", "ELEVEN", "TWELVE", "THIRTEEN", "FOURTEEN",
+        "FIFTEEN", "SIXTEEN", "SEVENTEEN", "EIGHTEEN", "NINETEEN", "TWENTY",
+    }
+    local value = words[count] or tostring(count)
+    return "ONE DAY, " .. value .. (count == 1 and " BOARDING" or " BOARDINGS")
+end
+
 local function rlDayStart(ts)
     local d = os.date("*t", ts or os.time())
     return os.time{year=d.year, month=d.month, day=d.day, hour=0, min=0, sec=0}
+end
+
+-- Display-only lookup: never replace the database title used for statistics
+-- grouping, selections or synchronization. Ambiguous titles keep their original.
+function Shelf:statsDisplayTitle(title, md5)
+    if self._stats_title_books ~= self.books then
+        local titles, hashes = {}, {}
+        local saved_titles = store:readSetting("stats_filename_titles") or {}
+        local saved_hashes = store:readSetting("stats_filename_hashes") or {}
+        local changed = false
+        local function add(map, key, value)
+            if not key or key == "" then return end
+            if map[key] == nil then map[key] = value
+            elseif map[key] ~= value then map[key] = false end
+        end
+        local function remember(map, key, value)
+            if not key or key == "" then return end
+            if map[key] == nil then map[key], changed = value, true
+            elseif map[key] ~= value and map[key] ~= false then map[key], changed = false, true end
+        end
+        local ok, DocSettings = pcall(require, "docsettings")
+        local function rememberPath(path, known_title, source_title)
+            if not path or path == "" then return end
+            local name = basename(path)
+            add(titles, known_title, name)
+            add(titles, source_title, name)
+            add(titles, name, name)
+            remember(saved_titles, known_title, name)
+            remember(saved_titles, source_title, name)
+            remember(saved_titles, name, name)
+            if ok then
+                pcall(function()
+                    local settings = DocSettings:open(path)
+                    local props = settings:readSetting("doc_props") or {}
+                    local checksum = settings:readSetting("partial_md5_checksum")
+                    add(titles, props.title, name)
+                    add(hashes, checksum, name)
+                    remember(saved_titles, props.title, name)
+                    if checksum and checksum ~= "" and saved_hashes[checksum] ~= name then
+                        saved_hashes[checksum], changed = name, true
+                    end
+                    settings:close()
+                end)
+            end
+        end
+        for _, book in ipairs(self.books or {}) do
+            rememberPath(book.path, book.title, book.source_title)
+        end
+        -- KOReader normally retains history and the .sdr sidecar after a book
+        -- file is removed. Use them once to migrate names deleted before this
+        -- persistent map existed.
+        local ok_history, history = pcall(require, "readhistory")
+        if not self._stats_history_names_loaded and ok_history and history then
+            if not history.hist or #history.hist == 0 then pcall(function() history:reload() end) end
+            for _, entry in ipairs(history.hist or {}) do
+                if entry and entry.file then rememberPath(entry.file) end
+            end
+            self._stats_history_names_loaded = true
+        end
+        if changed then
+            store:saveSetting("stats_filename_titles", saved_titles)
+            store:saveSetting("stats_filename_hashes", saved_hashes)
+            store:flush()
+        end
+        self._stats_display_titles, self._stats_display_hashes = titles, hashes
+        self._stats_saved_titles, self._stats_saved_hashes = saved_titles, saved_hashes
+        self._stats_title_books = self.books
+    end
+    local resolved = (md5 and self._stats_display_hashes and self._stats_display_hashes[md5])
+        or (md5 and self._stats_saved_hashes and self._stats_saved_hashes[md5])
+        or (self._stats_display_titles and self._stats_display_titles[title])
+        or (self._stats_saved_titles and self._stats_saved_titles[title])
+    if resolved then return resolved end
+    -- Some EPUB metadata appends a long blurb in parentheses. If the deleted
+    -- book's former filename is still known from KOReader history, keep that
+    -- concise filename instead of exposing the metadata suffix.
+    for _, filename in pairs(self._stats_saved_titles or {}) do
+        if type(filename) == "string" and filename ~= "" and title:sub(1, #filename) == filename then
+            local suffix = title:sub(#filename + 1)
+            if suffix:sub(1, 3) == "（" or suffix:sub(1, 1) == "("
+                    or suffix:sub(1, 3) == "【" or suffix:sub(1, 1) == "[" then
+                return filename
+            end
+        end
+    end
+    return title
 end
 
 function Shelf:readingRows(from_ts, to_ts)
@@ -3485,7 +4202,7 @@ local function rlMetricIcon(bb, filename, x, y, size)
     local path = PLUGIN_DIR .. "/train-icons-svg/" .. filename
     if not lfs.attributes(path, "mode") then return end
     local ok, widget = pcall(function()
-        return ImageWidget:new{file=path, width=size, height=size, alpha=true, file_do_cache=false}
+        return ImageWidget:new{file=path, width=size, height=size, alpha=true}
     end)
     if ok and widget then
         pcall(widget.paintTo, widget, bb, x, y)
@@ -3885,7 +4602,7 @@ function Shelf:paintReadingDay(bb, x, y, w, h)
         {top=true, bottom=true, left=true, right=true, notch_x=X(770), notch_y=Y(714)})
     T("阅读日票 · READING DAY PASS", 58, 67, 11, true, 420, ink)
     T("DAY TICKET", 58, 101, 42, true, 600, ink)
-    T("今日阅读轨迹 / ONE DAY, FOUR BOARDINGS", 58, 177, 12, false, 560, muted)
+    T("今日阅读轨迹 / " .. rlBoardingCaption(#boardings), 58, 177, 12, false, 560, muted)
     DL(53,235,952,235,line,1)
     T("日期 · DATE", 58, 246, 9, false, 120, muted); T(rlDate(start), 58, 266, 16, true, 150, ink)
     L(240,243,240,282,line,1)
@@ -3942,7 +4659,7 @@ function Shelf:paintReadingDay(bb, x, y, w, h)
             end
             T(os.date("%H:%M", row.time), 69, cy-6, 10, false, 70, muted)
             T("上车", 206, cy-8, 15, true, 64, ink)
-            T("《" .. row.title .. "》", 294, cy-11, 16, true, 430, ink)
+            T("《" .. self:statsDisplayTitle(row.title, row.md5) .. "》", 294, cy-11, 16, true, 430, ink)
             T("第 " .. tostring(row.first_page or 0) .. " 页 · 当前阅读", 294, cy+15, 9, false, 380, muted)
             T(rlTime(row.duration), 876, cy-8, 14, false, 80, ink)
             self.stats_hit_books[#self.stats_hit_books + 1] = {x=X(270), y=Y(cy-20), w=math.floor(500*s), h=math.floor(38*s), title=row.title}
@@ -4041,7 +4758,7 @@ function Shelf:paintReadingWeek(bb, x, y, w, h)
                 seen[row.id] = true
                 book_count = book_count + 1
                 p.L(cx, branch_y, cx, branch_y + 25, BB.COLOR_GRAY_8, 1)
-                p.CT("《" .. rlEllipsize(row.title, 8) .. "》", cx - 60, branch_y + 31, 120, 9, true, BB.COLOR_BLACK)
+                p.CT("《" .. rlEllipsize(self:statsDisplayTitle(row.title, row.md5), 8) .. "》", cx - 60, branch_y + 31, 120, 9, true, BB.COLOR_BLACK)
                 p.CT("第 " .. tostring(row.first_page or 0) .. " 页", cx - 60, branch_y + 50, 120, 8, false, BB.COLOR_GRAY_8)
                 self.stats_hit_books[#self.stats_hit_books + 1] = {x=p.X(cx-62), y=p.Y(branch_y+24), w=math.floor(124*p.s), h=math.floor(48*p.sy), title=row.title}
                 branch_y = branch_y + 78
@@ -4128,7 +4845,7 @@ local function paintReadingMonthBody(self, bb, x, y, w, h)
                     local span_w = book.span_days * cell_w - 8
                     p.R(sx, sy, span_w, 16, color.bg)
                     local max_chars = math.max(3, math.floor((span_w - 8) / 10))
-                    p.CT(rlEllipsize(book.title, max_chars), sx, sy + 2, span_w, 7, true, color.fg)
+                    p.CT(rlEllipsize(self:statsDisplayTitle(book.title), max_chars), sx, sy + 2, span_w, 7, true, color.fg)
                     self.stats_hit_books[#self.stats_hit_books + 1] = {
                         x=p.X(sx), y=p.Y(sy), w=math.floor(span_w*p.s), h=math.floor(19*p.sy), title=book.title,
                     }
@@ -4313,7 +5030,7 @@ function Shelf:paintReadingBook(bb, x, y, w, h)
         local cover_chars = utf8Chars(title)
         for i = 1, math.min(5, #cover_chars) do p.T(cover_chars[i], 108, 239 + (i-1)*20, 12, true, 34, BB.COLOR_BLACK) end
     end
-    p.T("《" .. title .. "》", 271, 244, 21, true, 445, BB.COLOR_BLACK)
+    p.T("《" .. self:statsDisplayTitle(title, selected[1] and selected[1].md5) .. "》", 271, 244, 21, true, 445, BB.COLOR_BLACK)
     p.T(author .. " · BOARDING DATE " .. first_date, 271, 282, 10, false, 445, BB.COLOR_GRAY_8)
     p.T("当前进度", 776, 238, 9, false, 125, BB.COLOR_GRAY_8)
     p.T(tostring(progress) .. "%", 776, 263, 29, true, 125, BB.COLOR_BLACK)
@@ -4465,7 +5182,7 @@ function Shelf:paintReadingScreen(bb, x, y, w, h)
             local cy = route_top + math.floor((i - 1) * (route_bottom - route_top) / math.max(1, #stops - 1))
             p.Circle(route_x, cy, i == 1 and 11 or 8, i == 1 and BB.COLOR_BLACK or BB.COLOR_WHITE)
             if i ~= 1 then p.Circle(route_x, cy, 4, BB.COLOR_GRAY_8) end
-            local label = (show_title and not privacy and ("《" .. row.title .. "》") or "隐私阅读节点")
+            local label = (show_title and not privacy and ("《" .. self:statsDisplayTitle(row.title, row.md5) .. "》") or "隐私阅读节点")
             p.T(label, route_x + 32, cy - 13, 13, true, 430, BB.COLOR_BLACK)
             p.T((show_node and not privacy and ("第 " .. tostring(row.display_page or row.page or 0) .. " 页") or "阅读节点") .. " · " .. rlTime(row.duration), route_x + 32, cy + 12, 9, false, 430, BB.COLOR_GRAY_8)
         end
@@ -4563,9 +5280,20 @@ function Shelf:paintShowcase(bb, x, y, width, height)
             local bx, by = cursor, row_bottom - h
             local side_drop = math.max(2, math.min(8, math.floor(depth * .45 + .5)))
             local outer_x = paintSkewedBookFace(bb, bx, by, w, h, lean, depth, depth_level, side_drop)
-            for row_y = 0, h - 1 do
-                local shift = h <= 1 and lean or math.floor(lean * (h - 1 - row_y) / (h - 1) + .5)
-                bb:paintRect(bx + shift, by + row_y, w, 1, BB.COLOR_GRAY_D)
+            -- Identical skewed face, grouped into vertical runs. A cover that
+            -- previously issued hundreds of one-pixel paint calls now needs at
+            -- most lean+1 calls, which matters on older ARM CPUs.
+            local face_row = 0
+            while face_row < h do
+                local shift = h <= 1 and lean or math.floor(lean * (h - 1 - face_row) / (h - 1) + .5)
+                local run = 1
+                while face_row + run < h do
+                    local next_shift = math.floor(lean * (h - 1 - face_row - run) / math.max(1, h - 1) + .5)
+                    if next_shift ~= shift then break end
+                    run = run + 1
+                end
+                bb:paintRect(bx + shift, by + face_row, w, run, BB.COLOR_GRAY_D)
+                face_row = face_row + run
             end
             -- Showcase deliberately uses the book's default front cover. It
             -- must not inherit the bookshelf's custom-spine image or any
@@ -4648,17 +5376,18 @@ end
 function Shelf:refreshBooks(force)
     if self._scan_running then return end
     local now = os.time()
-    if not force and self._last_scan_at and now - self._last_scan_at < 60 then return end
+    if not force and self._last_scan_at and now - self._last_scan_at < 180 then return end
     self._scan_running = true
+    local scan_signature = self._last_filesystem_signature
     local old_signature = booksSignature(self.books)
     local metadata_missing = false
     for _, book in ipairs(self.books or {}) do
-        if book.metadata_text == nil or book.language == nil then
+        if book.metadata_text == nil or book.language == nil or book.metadata_categories == nil then
             metadata_missing = true
             break
         end
     end
-    scanBooksAsync(self.scan_root, function(books)
+    scanBooksAsync(self.scan_root, self.books, metadata_missing, function(books)
         self._scan_running = false
         self._last_scan_at = os.time()
         if type(books) ~= "table" then return end
@@ -4666,6 +5395,8 @@ function Shelf:refreshBooks(force)
         store:saveSetting("scan_cache", { root = self.scan_root, books = books, saved_at = self._last_scan_at })
         store:flush()
         if force or metadata_missing or booksSignature(books) ~= old_signature then
+            self.pages, self.showcase_pages = nil, nil
+            self:invalidateBookshelfPageCache()
             self.books = books
             sortBooks(self.books)
             self.home_current_cache = nil
@@ -4674,6 +5405,14 @@ function Shelf:refreshBooks(force)
             self:invalidateHomeRenderCache()
             if self.tab == "showcase" then self:buildShowcasePages() else self:buildPages() end
             UIManager:setDirty(self, "ui")
+        end
+        local after_signature = self:libraryFingerprint(self.scan_root)
+        self._last_filesystem_signature = after_signature
+        if scan_signature and after_signature ~= scan_signature then
+            self._last_scan_at = nil
+            UIManager:scheduleIn(.2, function()
+                if Shelf.instance == self then self:refreshBooks(false) end
+            end)
         end
     end)
 end
@@ -4699,6 +5438,7 @@ function Shelf:setLibraryRoot(path)
     self:buildPages()
     UIManager:setDirty(self, "ui")
     self._last_scan_at = nil
+    self._last_filesystem_signature = self:libraryFingerprint(self.scan_root)
     self:refreshBooks(true)
 end
 
@@ -4804,8 +5544,12 @@ function Shelf:onHoldBook(_, gesture)
     end
     local book = self:bookAt(gesture.pos)
     if not book then
-        -- Configuration is intentionally available only from the matching
-        -- navbar item's long-press gesture.
+        -- The top 12% is outside HoldBook's gesture range and remains owned by
+        -- KOReader's native pull-down menu.  Only a real content-area blank
+        -- opens collection selection; the bottom navbar keeps its own hold.
+        if self.tab == "bookshelf" or self.tab == "showcase" then
+            self:showCollectionMenu()
+        end
         return true
     end
     if self.tab == "showcase" then
@@ -4949,7 +5693,7 @@ function Shelf:showReadingDurationBreakdown(hit)
     for i, book in ipairs(ranked) do
         local saved = book
         items[#items + 1] = {
-            text=string.format("%02d  《%s》  ·  %s", i, rlEllipsize(saved.title, 22), rlTime(saved.seconds)),
+            text=string.format("%02d  《%s》  ·  %s", i, rlEllipsize(self:statsDisplayTitle(saved.title), 22), rlTime(saved.seconds)),
             _rank_title=saved.title,
             callback=function()
                 if saved.frozen then return end
@@ -4994,20 +5738,7 @@ function Shelf:showReadingRecordMenu(record)
     local InputDialog = require("ui/widget/inputdialog")
     local menu
     local first = record and record.source_rows and record.source_rows[1] or {}
-    local minutes = math.max(0, math.floor((record and record.duration or 0) / 60))
     menu = Menu:new{items_font_size=PLUGIN_MENU_FONT_SIZE, items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE, items_per_page=8, title="阅读记录：《" .. tostring(record and record.title or "") .. "》", item_table={
-        {text="修改阅读时长（分钟）", callback=function()
-            local dialog
-            dialog = InputDialog:new{title="修改阅读时长", input=tostring(minutes), input_hint="分钟", buttons={{
-                {text="取消", callback=function() UIManager:close(dialog) end},
-                {text="保存", callback=function()
-                    local value = tonumber(dialog:getInputText() or "")
-                    if value and value >= 0 then self:updateReadingRecord(record, "duration", math.floor(value * 60)) end
-                    UIManager:close(dialog); UIManager:close(menu)
-                end},
-            }}}
-            UIManager:show(dialog)
-        end},
         {text="修改页码", callback=function()
             local dialog
             dialog = InputDialog:new{title="修改页码", input=tostring(first.display_page or first.page or 0), input_hint="页码", buttons={{
@@ -5024,7 +5755,7 @@ function Shelf:showReadingRecordMenu(record)
             self:deleteReadingRecord(record); UIManager:close(menu)
         end},
     }, width=math.floor(Screen:getWidth()*.72), height=math.floor(Screen:getHeight()*.38)}
-    menu.items_per_page = 3
+    menu.items_per_page = 2
     standardizePluginMenu(menu); UIManager:show(menu)
 end
 
@@ -5070,6 +5801,461 @@ function Shelf:showReadingLineMenu()
     standardizePluginMenu(menu); UIManager:show(menu)
 end
 
+function Shelf:collectionIndex()
+    local index = {
+        manual={},
+        uncategorized=0,
+    }
+    for _, name in ipairs(manual_category_names) do index.manual[name] = 0 end
+    for _, book in ipairs(self.books or {}) do
+        local manuals = manualCategoriesForBook(book.path)
+        for _, name in ipairs(manuals) do index.manual[name] = (index.manual[name] or 0) + 1 end
+        if #manuals == 0 then
+            index.uncategorized = index.uncategorized + 1
+        end
+    end
+    return index
+end
+
+local function sortedCategoryPairs(values)
+    local result = {}
+    for name, count in pairs(values or {}) do result[#result + 1] = {name=name, count=count} end
+    table.sort(result, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        return tostring(a.name):lower() < tostring(b.name):lower()
+    end)
+    return result
+end
+
+function Shelf:createManualCategory(assign_book, reopen_callback)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title="新建我的分类",
+        input_hint="分类名称",
+        buttons={{
+            {text="取消", callback=function() UIManager:close(dialog) end},
+            {text="创建", callback=function()
+                local name = trimCategory(dialog:getInputText())
+                if name ~= "" then
+                    local exists = false
+                    for _, saved in ipairs(manual_category_names) do
+                        if saved:lower() == name:lower() then name=saved; exists=true; break end
+                    end
+                    if not exists then manual_category_names[#manual_category_names + 1] = name end
+                    if assign_book then
+                        local categories = manualCategoriesForBook(assign_book.path)
+                        if not listHasCategory(categories, name) then categories[#categories + 1] = name end
+                        manual_book_categories[assign_book.path] = categories
+                    end
+                    saveManualCategories()
+                    UIManager:close(dialog)
+                    if reopen_callback then reopen_callback() end
+                    self:refreshLayout()
+                end
+            end},
+        }},
+    }
+    UIManager:show(dialog)
+end
+
+function Shelf:renameManualCategory(category, reopen_callback)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title="重命名分类",
+        input=tostring(category or ""),
+        input_hint="分类名称",
+        buttons={{
+            {text="取消", callback=function() UIManager:close(dialog) end},
+            {text="保存", callback=function()
+                local old_name = trimCategory(category)
+                local new_name = trimCategory(dialog:getInputText())
+                if old_name ~= "" and new_name ~= "" then
+                    local target_name = new_name
+                    for _, saved in ipairs(manual_category_names) do
+                        if saved:lower() == new_name:lower() and saved:lower() ~= old_name:lower() then
+                            target_name = saved
+                            break
+                        end
+                    end
+                    local next_names, target_seen = {}, false
+                    for _, saved in ipairs(manual_category_names) do
+                        local candidate = saved
+                        if saved:lower() == old_name:lower() then candidate = target_name end
+                        if candidate:lower() == target_name:lower() then
+                            if not target_seen then next_names[#next_names + 1] = target_name end
+                            target_seen = true
+                        else
+                            next_names[#next_names + 1] = candidate
+                        end
+                    end
+                    manual_category_names = next_names
+                    for path, categories in pairs(manual_book_categories) do
+                        local next_categories, seen = {}, {}
+                        for _, saved in ipairs(categories or {}) do
+                            local candidate = saved:lower() == old_name:lower() and target_name or saved
+                            local key = candidate:lower()
+                            if not seen[key] then
+                                seen[key] = true
+                                next_categories[#next_categories + 1] = candidate
+                            end
+                        end
+                        manual_book_categories[path] = #next_categories > 0 and next_categories or nil
+                    end
+                    local filter = self:getCollectionFilter()
+                    if filter.kind == "manual" and tostring(filter.value):lower() == old_name:lower() then
+                        self.collection_filter = {kind="manual", value=target_name, label=target_name}
+                        store:saveSetting("active_collection_filter", self.collection_filter)
+                    end
+                    saveManualCategories()
+                    UIManager:close(dialog)
+                    self:refreshLayout()
+                    if reopen_callback then reopen_callback() end
+                end
+            end},
+        }},
+    }
+    UIManager:show(dialog)
+end
+
+function Shelf:deleteManualCategory(category, reopen_callback)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text="删除分类“" .. tostring(category or "") .. "”？\n\n电子书不会被删除。",
+        ok_text="删除分类",
+        ok_callback=function()
+            local old_name = trimCategory(category)
+            local next_names = {}
+            for _, saved in ipairs(manual_category_names) do
+                if saved:lower() ~= old_name:lower() then next_names[#next_names + 1] = saved end
+            end
+            manual_category_names = next_names
+            for path, categories in pairs(manual_book_categories) do
+                local next_categories = {}
+                for _, saved in ipairs(categories or {}) do
+                    if saved:lower() ~= old_name:lower() then next_categories[#next_categories + 1] = saved end
+                end
+                manual_book_categories[path] = #next_categories > 0 and next_categories or nil
+            end
+            local filter = self:getCollectionFilter()
+            if filter.kind == "manual" and tostring(filter.value):lower() == old_name:lower() then
+                self.collection_filter = {kind="all", value="", label="全部书籍"}
+                store:saveSetting("active_collection_filter", self.collection_filter)
+            end
+            saveManualCategories()
+            self:refreshLayout()
+            if reopen_callback then reopen_callback() end
+        end,
+    })
+end
+
+function Shelf:showManualCategoryEditor(category, reopen_callback)
+    local Menu = require("ui/widget/menu")
+    local menu
+    menu = Menu:new{
+        items_font_size=PLUGIN_MENU_FONT_SIZE,
+        items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE,
+        title="管理分类 · " .. tostring(category),
+        item_table={
+            {text="重命名", callback=function()
+                UIManager:close(menu)
+                self:renameManualCategory(category, reopen_callback)
+            end},
+            {text="删除", callback=function()
+                UIManager:close(menu)
+                self:deleteManualCategory(category, reopen_callback)
+            end},
+        },
+        width=math.floor(Screen:getWidth()*.62),
+        height=math.floor(Screen:getHeight()*.34),
+    }
+    standardizePluginMenu(menu); UIManager:show(menu)
+end
+
+function Shelf:removeBookFile(book, defer_save)
+    if not book or not book.path then return false end
+    local path = book.path
+    local deleted = false
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if ok_fm and FileManager and type(FileManager.deleteFile) == "function" then
+        local target = liveFileManager() or FileManager
+        local ok_delete, result = pcall(FileManager.deleteFile, target, path, true)
+        deleted = ok_delete and result == true
+    else
+        deleted = os.remove(path) and true or false
+    end
+    if not deleted then return false end
+
+    book_overrides[path] = nil
+    showcase_overrides[path] = nil
+    manual_book_categories[path] = nil
+    if not defer_save then
+        saveOverrides()
+        saveShowcaseOverrides()
+        saveManualCategories()
+    end
+    for i = #(self.books or {}), 1, -1 do
+        if self.books[i].path == path then table.remove(self.books, i) end
+    end
+    return true
+end
+
+function Shelf:confirmDeleteBook(book, close_widget)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text="从设备永久删除《" .. tostring(book and book.title or "未命名") .. "》？\n\n电子书文件、阅读侧载设置和 KOReader 书库记录将一并清理。",
+        ok_text="删除书籍",
+        ok_callback=function()
+            if self:removeBookFile(book) then
+                if close_widget then UIManager:close(close_widget) end
+                self:refreshLayout()
+                UIManager:setDirty(self, "full")
+            end
+        end,
+    })
+end
+
+function Shelf:showBatchDeleteMenu()
+    local Menu = require("ui/widget/menu")
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local menu, selected = nil, {}
+    local books = {}
+    for _, book in ipairs(self.books or {}) do books[#books + 1] = book end
+    table.sort(books, function(a, b)
+        return tostring(a.title or a.path or ""):lower() < tostring(b.title or b.path or ""):lower()
+    end)
+    local function selectedCount()
+        local count = 0
+        for _ in pairs(selected) do count = count + 1 end
+        return count
+    end
+    local items = {}
+    for _, book in ipairs(books) do
+        local saved_book = book
+        items[#items + 1] = {
+            text_func=function()
+                return (selected[saved_book.path] and "☑ " or "□ ")
+                    .. tostring(saved_book.title or saved_book.path or "未命名")
+            end,
+            callback=function()
+                selected[saved_book.path] = selected[saved_book.path] and nil or saved_book
+                if menu.updateItems then menu:updateItems() end
+                UIManager:setDirty(menu, "ui")
+            end,
+        }
+    end
+    if #books == 0 then
+        items[#items + 1] = {text="暂无书籍", enabled_func=function() return false end}
+    end
+    items[#items + 1] = {
+        text_func=function() return "删除已选书籍 · " .. selectedCount() end,
+        enabled_func=function() return selectedCount() > 0 end,
+        callback=function()
+            local count = selectedCount()
+            UIManager:show(ConfirmBox:new{
+                text="从设备永久删除已选的 " .. count .. " 本书？\n\n此操作无法撤销。",
+                ok_text="全部删除",
+                ok_callback=function()
+                    local deleted = 0
+                    for _, saved_book in pairs(selected) do
+                        if self:removeBookFile(saved_book, true) then deleted = deleted + 1 end
+                    end
+                    -- Flush the three settings tables once for the whole batch;
+                    -- repeated writes are particularly costly on older Kindles.
+                    saveOverrides()
+                    saveShowcaseOverrides()
+                    saveManualCategories()
+                    UIManager:close(menu)
+                    self:refreshLayout()
+                    UIManager:setDirty(self, "full")
+                    if deleted < count then
+                        local InfoMessage = require("ui/widget/infomessage")
+                        UIManager:show(InfoMessage:new{
+                            text="已删除 " .. deleted .. " 本，另有 " .. (count - deleted) .. " 本删除失败。",
+                            timeout=4,
+                        })
+                    end
+                end,
+            })
+        end,
+    }
+    menu = Menu:new{
+        items_font_size=PLUGIN_MENU_FONT_SIZE,
+        items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE,
+        items_per_page=8,
+        title="批量删除书籍",
+        item_table=items,
+        width=math.floor(Screen:getWidth()*.82),
+        height=math.floor(Screen:getHeight()*.78),
+    }
+    standardizePluginMenu(menu); UIManager:show(menu)
+end
+
+function Shelf:showBookCategoryMenu(book)
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {
+        {text="＋ 新建分类", callback=function()
+            UIManager:close(menu)
+            self:createManualCategory(book, function() self:showBookCategoryMenu(book) end)
+        end},
+    }
+    for _, name in ipairs(manual_category_names) do
+        local saved = name
+        items[#items + 1] = {
+            text_func=function()
+                return (listHasCategory(manualCategoriesForBook(book.path), saved) and "☑ " or "□ ") .. saved
+            end,
+            callback=function()
+                local categories, next_categories = manualCategoriesForBook(book.path), {}
+                local removing = listHasCategory(categories, saved)
+                for _, value in ipairs(categories) do
+                    if not (removing and value:lower() == saved:lower()) then next_categories[#next_categories + 1] = value end
+                end
+                if not removing then next_categories[#next_categories + 1] = saved end
+                manual_book_categories[book.path] = #next_categories > 0 and next_categories or nil
+                saveManualCategories()
+                self:refreshLayout()
+                if menu.updateItems then menu:updateItems() end
+                UIManager:setDirty(menu, "ui")
+            end,
+        }
+    end
+    if #manual_category_names == 0 then
+        items[#items + 1] = {text="还没有自定义分类", enabled_func=function() return false end}
+    end
+    menu = Menu:new{
+        items_font_size=PLUGIN_MENU_FONT_SIZE,
+        items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE,
+        title="分类管理：《" .. tostring(book.title or "") .. "》",
+        item_table=items,
+        width=math.floor(Screen:getWidth()*.72),
+        height=math.floor(Screen:getHeight()*.58),
+    }
+    standardizePluginMenu(menu); UIManager:show(menu)
+end
+
+function Shelf:showBatchCategoryMenu(category)
+    local Menu = require("ui/widget/menu")
+    local menu
+    local books = {}
+    for _, book in ipairs(self.books or {}) do books[#books + 1] = book end
+    table.sort(books, function(a, b)
+        return tostring(a.title or a.path or ""):lower() < tostring(b.title or b.path or ""):lower()
+    end)
+    local items = {}
+    for _, book in ipairs(books) do
+        local saved_book = book
+        items[#items + 1] = {
+            text_func=function()
+                local mark = listHasCategory(manualCategoriesForBook(saved_book.path), category) and "☑ " or "□ "
+                local author = trimCategory(saved_book.author)
+                return mark .. tostring(saved_book.title or saved_book.path or "未命名")
+                    .. (author ~= "" and ("  ·  " .. author) or "")
+            end,
+            callback=function()
+                local categories, next_categories = manualCategoriesForBook(saved_book.path), {}
+                local removing = listHasCategory(categories, category)
+                for _, value in ipairs(categories) do
+                    if not (removing and value:lower() == category:lower()) then
+                        next_categories[#next_categories + 1] = value
+                    end
+                end
+                if not removing then next_categories[#next_categories + 1] = category end
+                manual_book_categories[saved_book.path] = #next_categories > 0 and next_categories or nil
+                saveManualCategories()
+                if menu.updateItems then menu:updateItems() end
+                UIManager:setDirty(menu, "ui")
+            end,
+        }
+    end
+    items[#items + 1] = {text="完成", callback=function()
+        saveManualCategories()
+        UIManager:close(menu)
+        self:refreshLayout()
+        UIManager:setDirty(self, "full")
+    end}
+    menu = Menu:new{
+        items_font_size=PLUGIN_MENU_FONT_SIZE,
+        items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE,
+        title="批量管理 · " .. tostring(category),
+        item_table=items,
+        width=math.floor(Screen:getWidth()*.82),
+        height=math.floor(Screen:getHeight()*.78),
+    }
+    standardizePluginMenu(menu); UIManager:show(menu)
+end
+
+function Shelf:showCollectionMenu()
+    local Menu = require("ui/widget/menu")
+    local owner, menu, index = self, nil, self:collectionIndex()
+    local function choose(kind, value, label)
+        return function()
+            UIManager:close(menu)
+            self:setCollectionFilter({kind=kind, value=value or "", label=label})
+        end
+    end
+    local function categoryItems(values, kind, manage)
+        local items = {}
+        for _, entry in ipairs(sortedCategoryPairs(values)) do
+            local name, count = entry.name, entry.count
+            local item = {
+                text=string.format("%s  ·  %d", name, count),
+                _manual_category=kind == "manual" and name or nil,
+                checked_func=function()
+                    local filter=self:getCollectionFilter()
+                    return filter.kind==kind and tostring(filter.value):lower()==tostring(name):lower()
+                end,
+                callback=manage and function()
+                        UIManager:close(menu)
+                        self:showBatchCategoryMenu(name)
+                    end or choose(kind, name, name),
+            }
+            items[#items + 1] = item
+        end
+        if #items == 0 then items[1] = {text="暂无分类", enabled_func=function() return false end} end
+        return items
+    end
+    local manual_items = {{text="＋ 新建分类", callback=function()
+        UIManager:close(menu)
+        self:createManualCategory(nil, function() self:showCollectionMenu() end)
+    end}}
+    for _, item in ipairs(categoryItems(index.manual, "manual", true)) do manual_items[#manual_items + 1] = item end
+    local current = self:getCollectionFilter()
+    local items = {
+        {text=string.format("全部书籍  ·  %d", #(self.books or {})), checked_func=function() return current.kind=="all" end,
+            callback=choose("all", "", "全部书籍")},
+    }
+    -- Existing categories are first-class destinations: one tap opens them.
+    for _, item in ipairs(categoryItems(index.manual, "manual", false)) do items[#items + 1] = item end
+    items[#items + 1] = {text="我的分类", sub_item_table=manual_items}
+    items[#items + 1] = {text=string.format("未分类  ·  %d", index.uncategorized),
+        checked_func=function() return current.kind=="uncategorized" end,
+        callback=choose("uncategorized", "", "未分类")}
+    menu = Menu:new{
+        items_font_size=PLUGIN_MENU_FONT_SIZE,
+        items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE,
+        title="藏书分类 · " .. tostring(current.label or "全部书籍"),
+        item_table=items,
+        width=math.floor(Screen:getWidth()*.76),
+        height=math.floor(Screen:getHeight()*.68),
+    }
+    -- Menu rows do not dispatch an item's hold_callback on every supported
+    -- KOReader release. Handle the hold at Menu level so nested rows work on
+    -- both KPW6 and Scribe.
+    function menu:onMenuHold(item)
+        if not item or not item._manual_category then return true end
+        local category = item._manual_category
+        UIManager:close(self)
+        owner:showManualCategoryEditor(category, function()
+            owner:showCollectionMenu()
+        end)
+        return true
+    end
+    standardizePluginMenu(menu); UIManager:show(menu)
+end
+
 function Shelf:showShowcaseBookEditor(book)
     local Menu = require("ui/widget/menu")
     local style = showcaseBookStyle(book.path)
@@ -5089,9 +6275,13 @@ function Shelf:showShowcaseBookEditor(book)
         return items
     end
     menu = Menu:new{items_font_size=PLUGIN_MENU_FONT_SIZE, items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE,
-        title="单本大小：《" .. tostring(book.title or "") .. "》",
-        item_table=levels("width", {48, 65, 85, 105, 125}, {"一档 · 较小", "二档 · 标准", "三档 · 较大", "四档 · 很大", "五档 · 最大"}),
-        width=math.floor(Screen:getWidth()*.62), height=math.floor(Screen:getHeight()*.36)}
+        title="书籍设置：《" .. tostring(book.title or "") .. "》",
+        item_table={
+            {text="分类管理", callback=function() UIManager:close(menu); self:showBookCategoryMenu(book) end},
+            {text="单本大小", sub_item_table=levels("width", {48, 65, 85, 105, 125}, {"一档 · 较小", "二档 · 标准", "三档 · 较大", "四档 · 很大", "五档 · 最大"})},
+            {text="删除书籍", callback=function() self:confirmDeleteBook(book, menu) end},
+        },
+        width=math.floor(Screen:getWidth()*.62), height=math.floor(Screen:getHeight()*.42)}
     standardizePluginMenu(menu); UIManager:show(menu)
 end
 
@@ -5130,6 +6320,8 @@ function Shelf:onPrevPage() if self.page > 1 then self.page=self.page-1;UIManage
 function Shelf:onGotoPage(page) self.page=math.max(1,math.min(page,self.page_num));UIManager:setDirty(self,"ui");return true end
 
 function Shelf:refreshLayout()
+    self.pages, self.showcase_pages = nil, nil
+    self:invalidateBookshelfPageCache()
     if self.tab == "showcase" then self:buildShowcasePages() else self:buildPages() end
     UIManager:setDirty(self, "ui")
 end
@@ -5137,6 +6329,7 @@ end
 -- A spine image changes only one placement. Rebuilding every page here is
 -- needlessly expensive on Scribe and can decode all custom images again.
 function Shelf:updateBookSpine(book_path, image_path)
+    self:invalidateBookshelfPageCache()
     for _, page in ipairs(self.pages or {}) do
         for _, placement in ipairs(page) do
             if placement.book and placement.book.path == book_path and placement.style then
@@ -5157,6 +6350,28 @@ function Shelf:showBookEditor(book)
         refreshTopMenu()
     end
     local items = {
+        { text="分类管理", callback=function() UIManager:close(editor_menu); self:showBookCategoryMenu(book) end },
+        { text="重命名", callback=function()
+            local InputDialog = require("ui/widget/inputdialog")
+            local dialog
+            dialog = InputDialog:new{
+                title="重命名书籍",
+                input=tostring(book.title or ""),
+                input_hint="留空可恢复原书名",
+                buttons={{
+                    {text="取消", callback=function() UIManager:close(dialog) end},
+                    {text="保存", callback=function()
+                        local name = trimCategory(dialog:getInputText())
+                        updateBookStyle(book.path, "title_override", name ~= "" and name or nil)
+                        book.title = name ~= "" and name or (book.source_title or basename(book.path))
+                        UIManager:close(dialog)
+                        UIManager:close(editor_menu)
+                        self:refreshLayout()
+                    end},
+                }},
+            }
+            UIManager:show(dialog)
+        end },
         { text="外观", sub_item_table={
             { text="宽度", sub_item_table={
                 {text="自动 · 按页数",checked_func=function()local ov=book_overrides[book.path];return type(ov)~="table" or ov.width==nil end,callback=function()style.width=defaultSpineWidthForPages(book.pages);set("width",nil)end},
@@ -5307,6 +6522,7 @@ function Shelf:showBookEditor(book)
             { text_func=function() return "宽度："..style.crop_pct.."%" end, callback=function()spinner("封面截取宽度",style.crop_pct,8,60,1,function(v)style.crop_pct=v;set("crop_pct",v)end)end },
         }},
         { text="恢复默认",callback=function()book_overrides[book.path]=nil;saveOverrides();self:refreshLayout()end },
+        { text="删除书籍", callback=function() self:confirmDeleteBook(book, editor_menu) end },
     }
     editor_menu = Menu:new{items_font_size=PLUGIN_MENU_FONT_SIZE, items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE, items_per_page=8, title="编辑：《"..book.title.."》", item_table=items,
         width=math.floor(Screen:getWidth()*.72),height=math.floor(Screen:getHeight()*.82) }
@@ -5450,6 +6666,10 @@ function Shelf:showGlobalSettings()
              callback=function() setWallpaperFitMode("fill"); self:clearWallpaperCache(); UIManager:setDirty(self,"ui") end},
         }},
     }}
+    items[#items + 1] = {text="批量删除书籍", callback=function()
+        UIManager:close(settings_menu)
+        self:showBatchDeleteMenu()
+    end}
     local geometry = navColumnMenuGeometry(self.tab, .72)
     settings_menu = Menu:new{items_font_size=PLUGIN_MENU_FONT_SIZE, items_mandatory_font_size=PLUGIN_MENU_FONT_SIZE, item_table=items,x=geometry.x,y=geometry.y,width=geometry.width,height=geometry.height}
     standardizePluginMenu(settings_menu); UIManager:show(settings_menu, nil, nil, geometry.x, geometry.y)
@@ -5458,6 +6678,20 @@ end
 function Shelf:onCloseAllMenus() UIManager:close(self); return true end
 function Shelf:onClose() UIManager:close(self); return true end
 function Shelf:onCloseWidget()
+    -- Discard work that belongs to this closed page. Scheduled workers safely
+    -- observe empty queues on their next turn, without retaining a full Shelf
+    -- instance throughout a reading session.
+    for _, item in ipairs(cover_load_queue) do
+        if item.shelf == self and cover_load_state[item.key] == "pending" then
+            cover_load_state[item.key] = nil
+        end
+    end
+    cover_load_queue = {}
+    home_crop_queue, home_crop_pending = {}, {}
+    home_cover_queue, home_cover_pending = {}, {}
+    self._showcase_cover_pending = nil
+    self._bookshelf_spine_pending = nil
+    self:invalidateBookshelfPageCache()
     self:clearWallpaperCache()
     self:invalidateHomeRenderCache()
     if Shelf.instance == self then Shelf.instance = nil end
@@ -5484,10 +6718,16 @@ function Plugin:showShelf(sui_plugin, standalone)
         -- private window stack here; doing so bypasses close callbacks and was
         -- the other source of dead navigation after a reader session.
         Shelf.instance.sui_plugin = sui_plugin or Shelf.instance.sui_plugin
-        UIManager:setDirty(Shelf.instance,"full")
+        UIManager:setDirty(Shelf.instance,"ui")
         UIManager:scheduleIn(.1, function()
             if Shelf.instance then Shelf.instance:refreshBooks(false) end
         end)
+        if G_reader_settings:readSetting("simplebookshelf_return_pending") then
+            G_reader_settings:delSetting("simplebookshelf_return_pending")
+            G_reader_settings:delSetting("simpleui_book_origin")
+            UIManager._simpleui_book_origin = nil
+            G_reader_settings:flush()
+        end
         closeSwitchBlocker()
         return true
     end
@@ -5502,9 +6742,14 @@ function Plugin:showShelf(sui_plugin, standalone)
     end
     UIManager:show(Shelf.instance)
     Shelf.instance:startHomeClockRefresh()
-    UIManager:nextTick(function()
-        if Shelf.instance then UIManager:setDirty(Shelf.instance, "full") end
-    end)
+    -- Only release the FileManager paint guard after the exact originating tab
+    -- has been placed above it in UIManager's stack.
+    if G_reader_settings:readSetting("simplebookshelf_return_pending") then
+        G_reader_settings:delSetting("simplebookshelf_return_pending")
+        G_reader_settings:delSetting("simpleui_book_origin")
+        UIManager._simpleui_book_origin = nil
+        G_reader_settings:flush()
+    end
     closeSwitchBlocker()
     return true
 end
@@ -5623,6 +6868,8 @@ function Plugin:_startReadingLineTextIndex(config)
     index.last_used = os.time()
     local page = math.max(1, #index.cumulative)
     local token = self._reading_line_text_index_token
+    local pages_per_step = COVER_CACHE_BYTE_BUDGET <= 6 * 1024 * 1024 and 1 or 2
+    local task_delay = COVER_CACHE_BYTE_BUDGET <= 6 * 1024 * 1024 and .10 or .04
     self._reading_line_text_index_doc = doc
 
     local function saveIndex()
@@ -5641,7 +6888,7 @@ function Plugin:_startReadingLineTextIndex(config)
         if token ~= self._reading_line_text_index_token
                 or self._reading_line_text_index_doc ~= doc then return end
         local processed = 0
-        while page < total_pages and processed < 2 do
+        while page < total_pages and processed < pages_per_step do
             local ok0, xp0 = pcall(doc.getPageXPointer, doc, page)
             local ok1, xp1 = pcall(doc.getPageXPointer, doc, page + 1)
             if not ok0 or not ok1 or not xp0 or not xp1 then
@@ -5657,7 +6904,7 @@ function Plugin:_startReadingLineTextIndex(config)
                 + readingLineCountTextChars(text)
             page = page + 1
             processed = processed + 1
-            if page % 16 == 0 then saveIndex() end
+            if page % 32 == 0 then saveIndex() end
         end
         if page >= total_pages then
             index.complete = true
@@ -5665,9 +6912,9 @@ function Plugin:_startReadingLineTextIndex(config)
             self._reading_line_text_index_doc = nil
             return
         end
-        UIManager:scheduleIn(.03, buildNext)
+        UIManager:scheduleIn(task_delay, buildNext)
     end
-    UIManager:scheduleIn(.8, buildNext)
+    UIManager:scheduleIn(COVER_CACHE_BYTE_BUDGET <= 6 * 1024 * 1024 and 1.5 or .8, buildNext)
 end
 
 function Plugin:onReaderReady(config)
@@ -5679,6 +6926,26 @@ function Plugin:init()
     Dispatcher:registerAction("simplebookshelf_show",{category="none",event="ShowSimpleBookshelf",title="打开 Reading Line",general=true})
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
+    end
+    -- ReaderUI:onHome()/onClose() constructs a fresh FileManager *above* every
+    -- existing underlay before plugins get a chance to restore Reading Line.
+    -- Guard FileManager's own paint method while a Reading Line return is
+    -- pending, so that even its first mandatory full refresh paints our neutral
+    -- transition instead of KOReader's native library. The guard is removed
+    -- logically (without monkey-patch churn) as soon as showShelf clears the
+    -- pending marker after restoring the saved return_tab.
+    local FileManager = require("apps/filemanager/filemanager")
+    if not FileManager._readingline_original_paintTo then
+        local original_paintTo = FileManager.paintTo
+        FileManager._readingline_original_paintTo = original_paintTo
+        FileManager.paintTo = function(filemanager, bb, x, y)
+            if G_reader_settings:readSetting("simplebookshelf_return_pending") then
+                -- Intentionally paint nothing: retain the book's last e-ink
+                -- frame until the originating Reading Line tab is ready.
+                return
+            end
+            return original_paintTo(filemanager, bb, x, y)
+        end
     end
     -- "Enabled" means this page is the home screen. Open it only when this
     -- exact plugin instance belongs to the live FileManager; ReaderUI loads the
@@ -5699,7 +6966,11 @@ function Plugin:init()
                 UIManager:scheduleIn(.2, showOnFileManager)
             end
         end
-        UIManager:scheduleIn(.2, showOnFileManager)
+        if G_reader_settings:readSetting("simplebookshelf_return_pending") then
+            UIManager:nextTick(showOnFileManager)
+        else
+            UIManager:scheduleIn(.2, showOnFileManager)
+        end
     end
 end
 function Plugin:onShowSimpleBookshelf()
@@ -5719,15 +6990,8 @@ function Plugin:onCloseDocument()
         or G_reader_settings:readSetting("simpleui_book_origin")
     logger.info("simplebookshelf: CloseDocument origin=", tostring(origin))
     if origin == "simplebookshelf" then
-        UIManager:nextTick(function()
-            if UIManager._simpleui_book_origin == "simplebookshelf" then
-                UIManager._simpleui_book_origin = nil
-            end
-            if G_reader_settings:readSetting("simpleui_book_origin") == "simplebookshelf" then
-                G_reader_settings:delSetting("simpleui_book_origin")
-                G_reader_settings:flush()
-            end
-        end)
+        G_reader_settings:saveSetting("simplebookshelf_return_pending", true)
+        G_reader_settings:flush()
     end
     return false
 end
